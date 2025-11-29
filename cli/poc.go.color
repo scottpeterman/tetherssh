@@ -1,0 +1,1318 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"image/color"
+	"log"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"tetherssh/internal/gopyte"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+	"github.com/creack/pty"
+)
+
+// Color mapping similar to your Python version
+var colorMappings = map[string]color.Color{
+	"black":          color.RGBA{0x00, 0x00, 0x00, 0xff},
+	"red":            color.RGBA{0xff, 0x00, 0x00, 0xff},
+	"green":          color.RGBA{0x00, 0xff, 0x00, 0xff},
+	"yellow":         color.RGBA{0xff, 0xff, 0x00, 0xff},
+	"blue":           color.RGBA{0x00, 0x00, 0xff, 0xff},
+	"magenta":        color.RGBA{0xff, 0x00, 0xff, 0xff},
+	"cyan":           color.RGBA{0x00, 0xff, 0xff, 0xff},
+	"white":          color.RGBA{0xff, 0xff, 0xff, 0xff},
+	"bright_black":   color.RGBA{0x7f, 0x7f, 0x7f, 0xff},
+	"bright_red":     color.RGBA{0xff, 0x5f, 0x5f, 0xff},
+	"bright_green":   color.RGBA{0x5f, 0xff, 0x5f, 0xff},
+	"bright_yellow":  color.RGBA{0xff, 0xff, 0x5f, 0xff},
+	"bright_blue":    color.RGBA{0x5f, 0x5f, 0xff, 0xff},
+	"bright_magenta": color.RGBA{0xff, 0x5f, 0xff, 0xff},
+	"bright_cyan":    color.RGBA{0x5f, 0xff, 0xff, 0xff},
+	"bright_white":   color.RGBA{0xff, 0xff, 0xff, 0xff},
+	"default":        color.RGBA{0xe0, 0xe0, 0xe0, 0xff},
+}
+
+// NativeTheme provides a more native terminal appearance
+type NativeTheme struct {
+	fyne.Theme
+	isDark bool
+}
+
+func NewNativeTheme(dark bool) *NativeTheme {
+	return &NativeTheme{
+		Theme:  theme.DefaultTheme(),
+		isDark: dark,
+	}
+}
+
+func (t *NativeTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNameForeground:
+		if t.isDark {
+			return color.RGBA{0xe0, 0xe0, 0xe0, 0xff}
+		}
+		return color.RGBA{0x2e, 0x34, 0x40, 0xff}
+	case theme.ColorNameBackground:
+		if t.isDark {
+			return color.RGBA{0x1e, 0x1e, 0x1e, 0xff}
+		}
+		return color.RGBA{0xfa, 0xfa, 0xfa, 0xff}
+	case theme.ColorNameSelection:
+		if t.isDark {
+			return color.RGBA{0x44, 0x47, 0x5a, 0x80}
+		}
+		return color.RGBA{0x00, 0x7a, 0xcc, 0x40}
+	case theme.ColorNamePrimary:
+		if t.isDark {
+			return color.RGBA{0x00, 0xd4, 0xaa, 0xff}
+		}
+		return color.RGBA{0x00, 0x78, 0xd4, 0xff}
+	}
+	return t.Theme.Color(name, variant)
+}
+
+func (t *NativeTheme) Font(style fyne.TextStyle) fyne.Resource {
+	return theme.DefaultTheme().Font(style)
+}
+
+// NativeTerminalWidget represents our native-looking terminal
+type NativeTerminalWidget struct {
+	widget.BaseWidget
+
+	// Core components - CHANGED: TextGrid instead of RichText
+	screen   *gopyte.WideCharScreen
+	stream   *gopyte.Stream
+	textGrid *widget.TextGrid
+	scroll   *container.Scroll
+
+	// PTY handling
+	ptyFile *os.File
+	cmd     *exec.Cmd
+
+	// State management
+	inAlternateScreen bool
+	scrollbackBuffer  []string
+	maxScrollbackSize int
+	title             string
+
+	// Font and sizing
+	fontSize   float32
+	charWidth  float32
+	charHeight float32
+	cols       int
+	rows       int
+
+	// Thread safety and performance
+	mutex         sync.RWMutex
+	updateChannel chan []byte
+	updatePending bool
+
+	// Context for cancellation
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// Size change detection
+	lastWidth   float32
+	lastHeight  float32
+	resizeTimer *time.Timer
+	resizeMutex sync.Mutex
+
+	// Selection support
+	selectionStart fyne.Position
+	selectionEnd   fyne.Position
+	isSelecting    bool
+
+	// Theme
+	theme *NativeTheme
+
+	// Default colors
+	fgColor string
+	bgColor string
+}
+
+// NewNativeTerminalWidget creates a new native-looking terminal emulator
+func NewNativeTerminalWidget(darkMode bool) *NativeTerminalWidget {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	t := &NativeTerminalWidget{
+		maxScrollbackSize: 10000,
+		updateChannel:     make(chan []byte, 1000),
+		ctx:               ctx,
+		cancel:            cancel,
+		fontSize:          13.0,
+		cols:              80,
+		rows:              24,
+		title:             "Terminal",
+		theme:             NewNativeTheme(darkMode),
+		fgColor:           "white",
+		bgColor:           "black",
+	}
+
+	t.calculateCharDimensions()
+
+	// Initialize GoPyte components
+	t.screen = gopyte.NewWideCharScreen(t.cols, t.rows, t.maxScrollbackSize)
+	t.stream = gopyte.NewStream(t.screen, false)
+
+	// CHANGED: Create TextGrid instead of RichText
+	t.textGrid = widget.NewTextGrid()
+	t.textGrid.ShowLineNumbers = false
+	t.textGrid.ShowWhitespace = false
+
+	// IMPORTANT: Initialize TextGrid size
+	t.initializeTextGridSize()
+
+	t.scroll = container.NewScroll(t.textGrid)
+	t.scroll.SetMinSize(fyne.NewSize(600, 400))
+
+	// Start background processing
+	go t.dataProcessor()
+	go t.updateProcessor()
+
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+func (t *NativeTerminalWidget) calculateCharDimensions() {
+	// More accurate character dimension calculations
+	switch runtime.GOOS {
+	case "darwin":
+		t.charWidth = t.fontSize * 0.55  // Fixed - this worked for width
+		t.charHeight = t.fontSize * 1.15 // Reduced from 1.25 - try smaller height
+	case "windows":
+		t.charWidth = t.fontSize * 0.57 // Fixed - this worked for width
+		t.charHeight = t.fontSize * 1.2 // Reduced from 1.3
+	default:
+		t.charWidth = t.fontSize * 0.56  // Fixed - this worked for width
+		t.charHeight = t.fontSize * 1.22 // Reduced from 1.28
+	}
+
+	log.Printf("Character dimensions: %.2fx%.2f for fontSize %.1f", t.charWidth, t.charHeight, t.fontSize)
+}
+
+// Add method to properly initialize TextGrid dimensions with accurate sizing
+func (t *NativeTerminalWidget) initializeTextGridSize() {
+	// Set initial size for TextGrid with more accurate calculations
+	initialSize := fyne.NewSize(
+		float32(t.cols)*t.charWidth,
+		float32(t.rows)*t.charHeight,
+	)
+	t.textGrid.Resize(initialSize)
+
+	log.Printf("Initial TextGrid size: %.1fx%.1f for %dx%d terminal",
+		initialSize.Width, initialSize.Height, t.cols, t.rows)
+}
+
+func (t *NativeTerminalWidget) CalculateTerminalSize(width, height float32) (int, int) {
+	if t.charWidth <= 0 || t.charHeight <= 0 {
+		return 80, 24
+	}
+
+	// FINE-TUNED: Even less padding for height since 2.5 lines are still missing
+	usableWidth := width - 8 // This worked for width
+	usableHeight := height   // Try zero padding - let's see the raw calculation
+
+	cols := int(usableWidth / t.charWidth)
+	rows := int(usableHeight / t.charHeight)
+
+	// More reasonable bounds with debug logging
+	if cols < 10 {
+		cols = 10
+	} else if cols > 500 {
+		cols = 500
+	}
+
+	if rows < 3 {
+		rows = 3
+	} else if rows > 200 {
+		rows = 200
+	}
+
+	log.Printf("CalculateTerminalSize: window=%.1fx%.1f, char=%.1fx%.1f, usable=%.1fx%.1f -> %dx%d (theoretical rows: %.1f)",
+		width, height, t.charWidth, t.charHeight, usableWidth, usableHeight, cols, rows, usableHeight/t.charHeight)
+
+	return cols, rows
+}
+
+// CreateRenderer implements fyne.Widget interface
+func (t *NativeTerminalWidget) CreateRenderer() fyne.WidgetRenderer {
+	return &nativeTerminalRenderer{
+		widget: t,
+		scroll: t.scroll,
+	}
+}
+
+type nativeTerminalRenderer struct {
+	widget *NativeTerminalWidget
+	scroll *container.Scroll
+}
+
+// Enhanced Layout method to handle TextGrid resizing properly with gopyte sync
+func (r *nativeTerminalRenderer) Layout(size fyne.Size) {
+	// Ensure scroll container takes full size
+	r.scroll.Resize(size)
+
+	// Calculate terminal dimensions
+	widget := r.widget
+	cols, rows := widget.CalculateTerminalSize(size.Width, size.Height)
+
+	// CRITICAL: Check if dimensions actually changed before doing expensive operations
+	widget.mutex.RLock()
+	currentCols, currentRows := widget.cols, widget.rows
+	needsUpdate := cols != currentCols || rows != currentRows
+	widget.mutex.RUnlock()
+
+	if needsUpdate {
+		log.Printf("Layout: Dimensions changed from %dx%d to %dx%d", currentCols, currentRows, cols, rows)
+
+		// Set TextGrid size based on calculated terminal dimensions
+		textGridSize := fyne.NewSize(
+			float32(cols)*widget.charWidth,
+			float32(rows)*widget.charHeight,
+		)
+
+		widget.textGrid.Resize(textGridSize)
+
+		// Trigger resize handling which will sync with gopyte
+		widget.handleResize(size.Width, size.Height)
+	} else {
+		// Even if dimensions didn't change, ensure TextGrid size is correct
+		textGridSize := fyne.NewSize(
+			float32(cols)*widget.charWidth,
+			float32(rows)*widget.charHeight,
+		)
+		widget.textGrid.Resize(textGridSize)
+	}
+}
+
+func (r *nativeTerminalRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(300, 200)
+}
+
+func (r *nativeTerminalRenderer) Refresh() {
+	r.scroll.Refresh()
+}
+
+func (r *nativeTerminalRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.scroll}
+}
+
+func (r *nativeTerminalRenderer) Destroy() {}
+
+// IMPROVED KEY HANDLING FOR FULL SCREEN APPS
+func (t *NativeTerminalWidget) TypedKey(key *fyne.KeyEvent) {
+	if t.ptyFile == nil {
+		return
+	}
+
+	var data []byte
+
+	switch key.Name {
+	case fyne.KeyReturn:
+		data = []byte("\r")
+	case fyne.KeyTab:
+		data = []byte("\t")
+	case fyne.KeyBackspace:
+		data = []byte("\x7f")
+	case fyne.KeyDelete:
+		data = []byte("\x1b[3~")
+	case fyne.KeyUp:
+		data = []byte("\x1b[A")
+	case fyne.KeyDown:
+		data = []byte("\x1b[B")
+	case fyne.KeyLeft:
+		data = []byte("\x1b[D")
+	case fyne.KeyRight:
+		data = []byte("\x1b[C")
+	case fyne.KeyHome:
+		data = []byte("\x1b[H")
+	case fyne.KeyEnd:
+		data = []byte("\x1b[F")
+	case fyne.KeyPageUp:
+		data = []byte("\x1b[5~")
+	case fyne.KeyPageDown:
+		data = []byte("\x1b[6~")
+	case fyne.KeyEscape:
+		data = []byte("\x1b")
+	case fyne.KeyF1:
+		data = []byte("\x1b[11~")
+	case fyne.KeyF2:
+		data = []byte("\x1b[12~")
+	case fyne.KeyF3:
+		data = []byte("\x1b[13~")
+	case fyne.KeyF4:
+		data = []byte("\x1b[14~")
+	case fyne.KeyF5:
+		data = []byte("\x1b[15~")
+	case fyne.KeyF6:
+		data = []byte("\x1b[17~")
+	case fyne.KeyF7:
+		data = []byte("\x1b[18~")
+	case fyne.KeyF8:
+		data = []byte("\x1b[19~")
+	case fyne.KeyF9:
+		data = []byte("\x1b[20~")
+	case fyne.KeyF10:
+		data = []byte("\x1b[21~")
+	case fyne.KeyF11:
+		data = []byte("\x1b[23~")
+	case fyne.KeyF12:
+		data = []byte("\x1b[24~")
+	}
+
+	if len(data) > 0 {
+		t.WriteToPTY(data)
+
+		// Force update for immediate feedback in full screen apps
+		if t.inAlternateScreen {
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				t.updatePending = true
+			}()
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) TypedRune(r rune) {
+	if t.ptyFile == nil {
+		return
+	}
+
+	if r < 32 {
+		data := []byte{byte(r)}
+		t.WriteToPTY(data)
+	} else {
+		data := []byte(string(r))
+		t.WriteToPTY(data)
+	}
+}
+
+func (t *NativeTerminalWidget) Focusable() bool {
+	return true
+}
+
+func (t *NativeTerminalWidget) FocusGained() {}
+
+func (t *NativeTerminalWidget) FocusLost() {}
+
+func (t *NativeTerminalWidget) MouseDown(event *desktop.MouseEvent) {
+	t.isSelecting = true
+	t.selectionStart = event.Position
+	t.selectionEnd = event.Position
+}
+
+func (t *NativeTerminalWidget) MouseUp(event *desktop.MouseEvent) {
+	t.isSelecting = false
+}
+
+func (t *NativeTerminalWidget) Dragged(event *fyne.DragEvent) {
+	if t.isSelecting {
+		t.selectionEnd = event.Position
+	}
+}
+
+// Size handling
+func (t *NativeTerminalWidget) handleResize(width, height float32) {
+	t.resizeMutex.Lock()
+	defer t.resizeMutex.Unlock()
+
+	if width == t.lastWidth && height == t.lastHeight {
+		return
+	}
+
+	t.lastWidth = width
+	t.lastHeight = height
+
+	if t.resizeTimer != nil {
+		t.resizeTimer.Stop()
+	}
+
+	t.resizeTimer = time.AfterFunc(150*time.Millisecond, func() {
+		t.performResize(width, height)
+	})
+}
+
+// Fixed performResize method with proper TextGrid sizing AND gopyte synchronization
+func (t *NativeTerminalWidget) performResize(width, height float32) {
+	newCols, newRows := t.CalculateTerminalSize(width, height)
+
+	t.mutex.Lock()
+	currentCols, currentRows := t.cols, t.rows
+	needsResize := newCols != currentCols || newRows != currentRows
+
+	if needsResize {
+		log.Printf("Resizing from %dx%d to %dx%d", currentCols, currentRows, newCols, newRows)
+
+		t.cols = newCols
+		t.rows = newRows
+
+		// CRITICAL: Resize gopyte screen FIRST, before TextGrid
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Error resizing gopyte screen: %v", r)
+				}
+			}()
+			t.screen.Resize(newCols, newRows)
+		}()
+
+		// THEN update TextGrid dimensions on main thread
+		fyne.Do(func() {
+			// Force TextGrid to acknowledge new dimensions
+			t.textGrid.Resize(fyne.NewSize(
+				float32(newCols)*t.charWidth,
+				float32(newRows)*t.charHeight,
+			))
+
+			// Force immediate refresh to sync sizes
+			t.textGrid.Refresh()
+		})
+	}
+	t.mutex.Unlock()
+
+	if needsResize {
+		go func() {
+			// Set PTY size AFTER gopyte resize
+			if t.ptyFile != nil {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("Error resizing PTY: %v", r)
+						}
+					}()
+
+					// Small delay to ensure gopyte resize completes
+					time.Sleep(50 * time.Millisecond)
+
+					pty.Setsize(t.ptyFile, &pty.Winsize{
+						Rows: uint16(newRows),
+						Cols: uint16(newCols),
+					})
+				}()
+			}
+
+			// CRITICAL: In alternate screen mode, send SIGWINCH signal to force app refresh
+			if t.inAlternateScreen && t.cmd != nil && t.cmd.Process != nil {
+				// Send SIGWINCH to tell the application to redraw
+				if runtime.GOOS != "windows" {
+					time.Sleep(100 * time.Millisecond)
+					t.cmd.Process.Signal(os.Signal(syscall.SIGWINCH))
+				}
+
+				// Also send a refresh sequence to force immediate redraw
+				time.Sleep(150 * time.Millisecond)
+				t.WriteToPTY([]byte("\x0c")) // Form feed to refresh screen
+			}
+
+			// Force multiple updates to ensure synchronization
+			t.updatePending = true
+			time.Sleep(100 * time.Millisecond)
+			t.updatePending = true
+		}()
+	}
+}
+
+// Enhanced PTY management with color support
+func (t *NativeTerminalWidget) StartShell() error {
+	var shell string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		shell = "powershell.exe"
+		args = []string{"-NoLogo"}
+	case "darwin":
+		shell = os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/zsh"
+		}
+	default:
+		shell = os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/bash"
+		}
+	}
+
+	cmd := exec.Command(shell, args...)
+
+	// Enhanced environment setup for color support
+	cmd.Env = append(os.Environ(),
+		"TERM=xterm-256color",
+		"COLORTERM=truecolor",
+		"FORCE_COLOR=1",
+		"CLICOLOR=1",
+		"CLICOLOR_FORCE=1",
+		fmt.Sprintf("COLUMNS=%d", t.cols),
+		fmt.Sprintf("LINES=%d", t.rows),
+		"LC_ALL=C.UTF-8",
+		"LANG=C.UTF-8",
+	)
+
+	// Platform-specific color environment variables
+	switch runtime.GOOS {
+	case "windows":
+		cmd.Env = append(cmd.Env, "ANSICON=1")
+	case "darwin":
+		cmd.Env = append(cmd.Env, "TERM_PROGRAM=Terminal")
+	}
+
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to start shell: %v", err)
+	}
+
+	t.ptyFile = ptmx
+	t.cmd = cmd
+
+	pty.Setsize(ptmx, &pty.Winsize{
+		Rows: uint16(t.rows),
+		Cols: uint16(t.cols),
+	})
+
+	go t.readFromPTY()
+	return nil
+}
+
+func (t *NativeTerminalWidget) readFromPTY() {
+	buffer := make([]byte, 4096)
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		default:
+			n, err := t.ptyFile.Read(buffer)
+			if err != nil {
+				if !strings.Contains(err.Error(), "file already closed") {
+					log.Printf("PTY read error: %v", err)
+				}
+				return
+			}
+
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buffer[:n])
+
+				select {
+				case t.updateChannel <- data:
+				case <-t.ctx.Done():
+					return
+				default:
+				}
+			}
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) dataProcessor() {
+	for {
+		select {
+		case data := <-t.updateChannel:
+			t.processTerminalData(data)
+		case <-t.ctx.Done():
+			return
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) processTerminalData(data []byte) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Error feeding data to stream: %v", r)
+			}
+		}()
+		t.stream.Feed(string(data))
+	}()
+
+	dataStr := string(data)
+	t.handleEscapeSequences(dataStr)
+	t.updatePending = true
+
+	if strings.Contains(dataStr, "\x1b]0;") {
+		t.extractWindowTitle(dataStr)
+	}
+}
+
+// ENHANCED ALTERNATE SCREEN DETECTION AND HANDLING WITH BUFFER CLEARING
+func (t *NativeTerminalWidget) handleEscapeSequences(data string) {
+	// More comprehensive alternate screen detection
+	if strings.Contains(data, "\x1b[?1049h") || strings.Contains(data, "\x1b[?47h") || strings.Contains(data, "\x1b[?1047h") {
+		if !t.inAlternateScreen {
+			log.Printf("Entering alternate screen mode")
+
+			// CRITICAL: Clear scrollback buffer when entering alternate screen
+			// This prevents line mode text from bleeding through
+			t.scrollbackBuffer = []string{}
+
+			t.preserveCurrentScreen()
+			t.inAlternateScreen = true
+
+			// Clear the screen immediately when entering alternate mode
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				fyne.Do(func() {
+					// Force a clear redraw for alternate screen
+					t.updatePending = true
+				})
+			}()
+		}
+	}
+
+	if strings.Contains(data, "\x1b[?1049l") || strings.Contains(data, "\x1b[?47l") || strings.Contains(data, "\x1b[?1047l") {
+		if t.inAlternateScreen {
+			log.Printf("Exiting alternate screen mode")
+			t.inAlternateScreen = false
+
+			// Force immediate update when exiting alternate screen
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				fyne.Do(func() {
+					t.updatePending = true
+				})
+			}()
+		}
+	}
+
+	// Handle screen clearing sequences
+	if strings.Contains(data, "\x1b[2J") || strings.Contains(data, "\x1b[H\x1b[2J") {
+		// Full screen clear - force update
+		t.updatePending = true
+	}
+}
+
+func (t *NativeTerminalWidget) extractWindowTitle(data string) {
+	start := strings.Index(data, "\x1b]0;")
+	if start >= 0 {
+		start += 4
+		end := strings.IndexAny(data[start:], "\x07\x1b")
+		if end >= 0 {
+			t.title = data[start : start+end]
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) preserveCurrentScreen() {
+	// Only preserve screen content if we're NOT already in alternate screen
+	// This prevents line mode bleeding
+	if !t.inAlternateScreen {
+		currentContent := t.extractScreenContent()
+		for _, line := range currentContent {
+			if strings.TrimSpace(line) != "" {
+				t.addToScrollback(line)
+			}
+		}
+		log.Printf("Preserved %d lines to scrollback", len(currentContent))
+	}
+}
+
+func (t *NativeTerminalWidget) addToScrollback(line string) {
+	t.scrollbackBuffer = append(t.scrollbackBuffer, line)
+	if len(t.scrollbackBuffer) > t.maxScrollbackSize {
+		removeCount := len(t.scrollbackBuffer) - t.maxScrollbackSize
+		t.scrollbackBuffer = t.scrollbackBuffer[removeCount:]
+	}
+}
+
+func (t *NativeTerminalWidget) updateProcessor() {
+	ticker := time.NewTicker(16 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if t.updatePending {
+				t.performRedraw()
+				t.updatePending = false
+			}
+		case <-t.ctx.Done():
+			return
+		}
+	}
+}
+
+// BETTER ALTERNATE SCREEN STATE MANAGEMENT WITH FORCED SYNCHRONIZATION
+func (t *NativeTerminalWidget) performRedraw() {
+	t.mutex.RLock()
+
+	var combinedLines []string
+	var combinedAttrs [][]gopyte.Attributes
+
+	// Check if gopyte thinks we're in alternate screen
+	gopyteAlternate := t.screen.IsUsingAlternate()
+
+	// Sync our state with gopyte's state
+	if gopyteAlternate != t.inAlternateScreen {
+		log.Printf("Syncing alternate screen state: gopyte=%v, widget=%v", gopyteAlternate, t.inAlternateScreen)
+		t.inAlternateScreen = gopyteAlternate
+	}
+
+	if t.inAlternateScreen {
+		// ALTERNATE SCREEN: Show only current screen content
+		combinedLines = t.extractScreenContent()
+		combinedAttrs = t.extractScreenAttributes()
+
+		// CRITICAL: Ensure we have exactly the right number of lines for alternate screen
+		// This prevents the geometry mismatch you're seeing
+		targetLines := t.rows
+
+		if len(combinedLines) < targetLines {
+			// Pad with empty lines
+			for len(combinedLines) < targetLines {
+				combinedLines = append(combinedLines, "")
+			}
+		} else if len(combinedLines) > targetLines {
+			// Trim to exact size
+			combinedLines = combinedLines[:targetLines]
+		}
+
+		// Ensure attributes match the line count exactly
+		if len(combinedAttrs) < len(combinedLines) {
+			for len(combinedAttrs) < len(combinedLines) {
+				emptyAttrs := make([]gopyte.Attributes, t.cols)
+				for i := range emptyAttrs {
+					emptyAttrs[i] = gopyte.Attributes{Fg: "default", Bg: "default"}
+				}
+				combinedAttrs = append(combinedAttrs, emptyAttrs)
+			}
+		} else if len(combinedAttrs) > len(combinedLines) {
+			combinedAttrs = combinedAttrs[:len(combinedLines)]
+		}
+
+		log.Printf("Alternate screen: %d lines, %d rows expected", len(combinedLines), targetLines)
+	} else {
+		// NORMAL MODE: Include scrollback + current content
+		combinedLines = make([]string, len(t.scrollbackBuffer))
+		copy(combinedLines, t.scrollbackBuffer)
+		currentContent := t.extractScreenContent()
+		currentAttrs := t.extractScreenAttributes()
+		combinedLines = append(combinedLines, currentContent...)
+
+		// Create empty attributes for scrollback buffer
+		scrollbackAttrs := make([][]gopyte.Attributes, len(t.scrollbackBuffer))
+		for i := range scrollbackAttrs {
+			if i < len(t.scrollbackBuffer) {
+				scrollbackAttrs[i] = make([]gopyte.Attributes, len(t.scrollbackBuffer[i]))
+				for j := range scrollbackAttrs[i] {
+					scrollbackAttrs[i][j] = gopyte.Attributes{Fg: "default", Bg: "default"}
+				}
+			}
+		}
+		combinedAttrs = append(scrollbackAttrs, currentAttrs...)
+
+		log.Printf("Normal mode: %d total lines (%d scrollback + %d current)", len(combinedLines), len(t.scrollbackBuffer), len(currentContent))
+	}
+
+	shouldAutoScroll := !t.inAlternateScreen
+
+	t.mutex.RUnlock()
+
+	fyne.Do(func() {
+		t.redrawTextGrid(combinedLines, combinedAttrs)
+
+		if shouldAutoScroll {
+			t.scroll.ScrollToBottom()
+		} else {
+			// In alternate screen, scroll to top to show full screen app properly
+			t.scroll.ScrollToTop()
+		}
+	})
+}
+
+// ENHANCED SCREEN CONTENT EXTRACTION FOR ALTERNATE SCREEN
+func (t *NativeTerminalWidget) extractScreenContent() []string {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Error extracting screen content: %v", r)
+		}
+	}()
+
+	display := t.screen.GetDisplay()
+	lines := make([]string, len(display))
+
+	for i, line := range display {
+		if t.inAlternateScreen {
+			// In alternate screen, preserve exact content including trailing spaces
+			lines[i] = line
+		} else {
+			// In normal mode, trim trailing spaces
+			lines[i] = strings.TrimRight(line, " ")
+		}
+	}
+
+	return lines
+}
+
+// NEW: Extract color attributes from gopyte screen
+func (t *NativeTerminalWidget) extractScreenAttributes() [][]gopyte.Attributes {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Error extracting screen attributes: %v", r)
+		}
+	}()
+
+	return t.getScreenAttributes()
+}
+
+// Helper method to get attributes - uses existing GetAttributes() from WideCharScreen
+func (t *NativeTerminalWidget) getScreenAttributes() [][]gopyte.Attributes {
+	return t.screen.GetAttributes()
+}
+
+// IMPROVED ALTERNATE SCREEN CURSOR HANDLING IN REDRAW
+func (t *NativeTerminalWidget) redrawTextGrid(combinedLines []string, combinedAttrs [][]gopyte.Attributes) {
+	if len(combinedLines) == 0 {
+		t.textGrid.SetText("")
+		return
+	}
+
+	// CRITICAL: Set TextGrid size explicitly before setting content
+	targetHeight := float32(len(combinedLines)) * t.charHeight
+	if t.inAlternateScreen {
+		// In alternate screen, use exactly the terminal rows, not the content length
+		targetHeight = float32(t.rows) * t.charHeight
+	}
+
+	t.textGrid.Resize(fyne.NewSize(
+		float32(t.cols)*t.charWidth,
+		targetHeight,
+	))
+
+	// Create a copy for modification
+	modifiedLines := make([]string, len(combinedLines))
+	copy(modifiedLines, combinedLines)
+
+	// In alternate screen mode, ensure we pad or trim to exact row count
+	if t.inAlternateScreen {
+		if len(modifiedLines) < t.rows {
+			// Pad with empty lines
+			for len(modifiedLines) < t.rows {
+				modifiedLines = append(modifiedLines, "")
+			}
+		} else if len(modifiedLines) > t.rows {
+			// Trim to exact size
+			modifiedLines = modifiedLines[:t.rows]
+		}
+
+		// Ensure each line is exactly the right width
+		for i := range modifiedLines {
+			runes := []rune(modifiedLines[i])
+			if len(runes) < t.cols {
+				// Pad with spaces
+				padding := strings.Repeat(" ", t.cols-len(runes))
+				modifiedLines[i] = modifiedLines[i] + padding
+			} else if len(runes) > t.cols {
+				// Trim to width
+				modifiedLines[i] = string(runes[:t.cols])
+			}
+		}
+	}
+
+	// Get cursor position from gopyte
+	cursorX, cursorY := t.screen.GetCursor()
+
+	// ENHANCED CURSOR POSITIONING FOR ALTERNATE SCREEN
+	var adjustedCursorY int
+	var shouldShowCursor bool = true
+
+	if t.inAlternateScreen {
+		// ALTERNATE SCREEN: Trust gopyte coordinates exactly
+		adjustedCursorY = cursorY
+
+		// Validate cursor position is within bounds
+		if cursorY >= 0 && cursorY < len(modifiedLines) && cursorX >= 0 && cursorX < t.cols {
+			shouldShowCursor = true
+		} else {
+			shouldShowCursor = false
+		}
+	} else {
+		// NORMAL MODE: Use intelligent line detection
+		actualTypingLine := -1
+		for i := len(modifiedLines) - 1; i >= 0; i-- {
+			trimmed := strings.TrimSpace(modifiedLines[i])
+			if trimmed != "" && !strings.HasPrefix(trimmed, "~") {
+				actualTypingLine = i
+				break
+			}
+		}
+
+		if actualTypingLine >= 0 {
+			adjustedCursorY = actualTypingLine
+		} else {
+			adjustedCursorY = cursorY
+		}
+	}
+
+	// PLACE CURSOR (CHARACTER REPLACEMENT STRATEGY)
+	if shouldShowCursor && adjustedCursorY >= 0 && adjustedCursorY < len(modifiedLines) && cursorX >= 0 {
+		currentLine := modifiedLines[adjustedCursorY]
+
+		if cursorX < len([]rune(currentLine)) {
+			// Replace character at cursor position
+			runes := []rune(currentLine)
+			if cursorX < len(runes) {
+				runes[cursorX] = '█'
+				modifiedLines[adjustedCursorY] = string(runes)
+			}
+		} else {
+			// Extend line with cursor at end
+			runes := []rune(currentLine)
+			padding := strings.Repeat(" ", cursorX-len(runes))
+			modifiedLines[adjustedCursorY] = currentLine + padding + "█"
+		}
+	}
+
+	// Set the text in the TextGrid
+	fullText := strings.Join(modifiedLines, "\n")
+	t.textGrid.SetText(fullText)
+
+	// Apply colors
+	t.applyColorsToTextGrid(modifiedLines, combinedAttrs)
+}
+
+// Apply colors to individual cells in the TextGrid using gopyte attributes
+func (t *NativeTerminalWidget) applyColorsToTextGrid(lines []string, attrs [][]gopyte.Attributes) {
+	// Ensure we have rows
+	if len(t.textGrid.Rows) == 0 {
+		return
+	}
+
+	// Apply colors based on gopyte attributes
+	for rowIdx, line := range lines {
+		if rowIdx >= len(t.textGrid.Rows) || rowIdx >= len(attrs) {
+			break
+		}
+
+		// Apply colors from gopyte attributes
+		t.applyLineColorsFromAttributes(rowIdx, line, attrs[rowIdx])
+	}
+
+	t.textGrid.Refresh()
+}
+
+// Apply colors to a specific line using gopyte attributes
+func (t *NativeTerminalWidget) applyLineColorsFromAttributes(rowIdx int, line string, lineAttrs []gopyte.Attributes) {
+	if rowIdx >= len(t.textGrid.Rows) {
+		return
+	}
+
+	row := t.textGrid.Rows[rowIdx]
+	runes := []rune(line)
+
+	for charIdx, char := range runes {
+		if charIdx >= len(row.Cells) || charIdx >= len(lineAttrs) {
+			break
+		}
+
+		// Get gopyte attributes for this character
+		attr := lineAttrs[charIdx]
+
+		// Create or get the style for this cell
+		if row.Cells[charIdx].Style == nil {
+			row.Cells[charIdx].Style = &widget.CustomTextGridStyle{}
+		}
+
+		style := row.Cells[charIdx].Style.(*widget.CustomTextGridStyle)
+
+		// Apply foreground color from gopyte
+		if fgColor := t.mapGopyteColorToFyne(attr.Fg); fgColor != nil {
+			style.FGColor = fgColor
+		}
+
+		// Apply background color from gopyte
+		if bgColor := t.mapGopyteColorToFyne(attr.Bg); bgColor != nil {
+			style.BGColor = bgColor
+		}
+
+		// Note: TextGrid doesn't directly support text styles like bold/italic
+		// but we could simulate bold with brighter colors
+		if attr.Bold {
+			// Make color brighter for bold effect
+			if brightColor := t.makeBrighter(style.FGColor); brightColor != nil {
+				style.FGColor = brightColor
+			}
+		}
+
+		// Ensure the character is set correctly
+		row.Cells[charIdx].Rune = char
+	}
+}
+
+// Map gopyte color names to Fyne colors
+func (t *NativeTerminalWidget) mapGopyteColorToFyne(colorName string) color.Color {
+	if colorName == "" || colorName == "default" {
+		return nil // Use default theme color
+	}
+
+	// First check our color mappings
+	if fyneColor, exists := colorMappings[colorName]; exists {
+		return fyneColor
+	}
+
+	// Handle 256-color format (colorNNN)
+	if strings.HasPrefix(colorName, "color") {
+		// For now, map to basic colors
+		// You could extend this to handle full 256-color palette
+		return colorMappings["white"]
+	}
+
+	// Map common gopyte color names to our color mappings
+	switch colorName {
+	case "brown":
+		return colorMappings["yellow"] // brown is often rendered as yellow
+	default:
+		return colorMappings["white"] // fallback
+	}
+}
+
+// Make a color brighter for bold effect
+func (t *NativeTerminalWidget) makeBrighter(c color.Color) color.Color {
+	if c == nil {
+		return nil
+	}
+
+	r, g, b, a := c.RGBA()
+
+	// Convert from 16-bit to 8-bit values
+	r8, g8, b8, a8 := uint8(r>>8), uint8(g>>8), uint8(b>>8), uint8(a>>8)
+
+	// Make brighter by adding to each component (with overflow protection)
+	brighten := uint8(40)
+
+	newR := r8
+	if r8 < 255-brighten {
+		newR = r8 + brighten
+	} else {
+		newR = 255
+	}
+
+	newG := g8
+	if g8 < 255-brighten {
+		newG = g8 + brighten
+	} else {
+		newG = 255
+	}
+
+	newB := b8
+	if b8 < 255-brighten {
+		newB = b8 + brighten
+	} else {
+		newB = 255
+	}
+
+	return color.RGBA{newR, newG, newB, a8}
+}
+
+// Parse ANSI color escape sequences
+func (t *NativeTerminalWidget) parseANSIColor(escSeq, currentFg string, currentBold bool) (string, bool) {
+	codes := strings.Split(escSeq, ";")
+
+	for _, code := range codes {
+		switch code {
+		case "0":
+			return "default", false // Reset
+		case "1":
+			currentBold = true
+		case "30":
+			return "black", currentBold
+		case "31":
+			return "red", currentBold
+		case "32":
+			return "green", currentBold
+		case "33":
+			return "yellow", currentBold
+		case "34":
+			return "blue", currentBold
+		case "35":
+			return "magenta", currentBold
+		case "36":
+			return "cyan", currentBold
+		case "37":
+			return "white", currentBold
+		case "90":
+			return "bright_black", currentBold
+		case "91":
+			return "bright_red", currentBold
+		case "92":
+			return "bright_green", currentBold
+		case "93":
+			return "bright_yellow", currentBold
+		case "94":
+			return "bright_blue", currentBold
+		case "95":
+			return "bright_magenta", currentBold
+		case "96":
+			return "bright_cyan", currentBold
+		case "97":
+			return "bright_white", currentBold
+		}
+	}
+
+	return currentFg, currentBold
+}
+
+// These methods will be used once you add GetAttributes() to your WideCharScreen
+func (t *NativeTerminalWidget) getColorName(colorValue interface{}) string {
+	if colorValue == nil {
+		return "default"
+	}
+
+	switch v := colorValue.(type) {
+	case string:
+		return v
+	case int:
+		// Handle ANSI color codes
+		switch v {
+		case 0:
+			return "black"
+		case 1:
+			return "red"
+		case 2:
+			return "green"
+		case 3:
+			return "yellow"
+		case 4:
+			return "blue"
+		case 5:
+			return "magenta"
+		case 6:
+			return "cyan"
+		case 7:
+			return "white"
+		case 8:
+			return "bright_black"
+		case 9:
+			return "bright_red"
+		case 10:
+			return "bright_green"
+		case 11:
+			return "bright_yellow"
+		case 12:
+			return "bright_blue"
+		case 13:
+			return "bright_magenta"
+		case 14:
+			return "bright_cyan"
+		case 15:
+			return "bright_white"
+		default:
+			return "default"
+		}
+	default:
+		return "default"
+	}
+}
+
+// Public API methods
+func (t *NativeTerminalWidget) WriteToPTY(data []byte) error {
+	if t.ptyFile != nil {
+		_, err := t.ptyFile.Write(data)
+		return err
+	}
+	return fmt.Errorf("PTY not initialized")
+}
+
+func (t *NativeTerminalWidget) GetTitle() string {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	return t.title
+}
+
+func (t *NativeTerminalWidget) Clear() {
+	t.WriteToPTY([]byte("\x1b[2J\x1b[H"))
+}
+
+// Test colors
+func (t *NativeTerminalWidget) TestColors() {
+	colorTest := "\x1b[31mRed\x1b[0m \x1b[32mGreen\x1b[0m \x1b[33mYellow\x1b[0m \x1b[34mBlue\x1b[0m \x1b[35mMagenta\x1b[0m \x1b[36mCyan\x1b[0m\n"
+	brightTest := "\x1b[91mBright Red\x1b[0m \x1b[92mBright Green\x1b[0m \x1b[93mBright Yellow\x1b[0m \x1b[94mBright Blue\x1b[0m\n"
+	formatTest := "\x1b[1mBold\x1b[0m Normal\n"
+	emojiTest := "🔴 Red Circle 🟢 Green Circle 🔵 Blue Circle\n"
+
+	fullTest := colorTest + brightTest + formatTest + emojiTest + "Test completed!\n"
+	t.WriteToPTY([]byte(fullTest))
+}
+
+func (t *NativeTerminalWidget) Close() {
+	t.cancel()
+
+	t.resizeMutex.Lock()
+	if t.resizeTimer != nil {
+		t.resizeTimer.Stop()
+	}
+	t.resizeMutex.Unlock()
+
+	if t.ptyFile != nil {
+		t.ptyFile.Close()
+	}
+
+	if t.cmd != nil && t.cmd.Process != nil {
+		t.cmd.Process.Kill()
+	}
+}
+
+// Main application
+func main() {
+	myApp := app.New()
+
+	darkMode := true
+	myApp.Settings().SetTheme(NewNativeTheme(darkMode))
+
+	myWindow := myApp.NewWindow("Terminal")
+	myWindow.Resize(fyne.NewSize(1000, 700))
+
+	// Create terminal widget
+	terminal := NewNativeTerminalWidget(darkMode)
+
+	if err := terminal.StartShell(); err != nil {
+		log.Fatal("Failed to start shell:", err)
+	}
+
+	content := container.NewBorder(nil, nil, nil, nil, terminal)
+	myWindow.SetContent(content)
+
+	myWindow.SetCloseIntercept(func() {
+		terminal.Close()
+		myApp.Quit()
+	})
+
+	myWindow.Canvas().Focus(terminal)
+
+	// Update window title dynamically
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				title := terminal.GetTitle()
+				if title != "" && title != "Terminal" {
+					fyne.Do(func() {
+						myWindow.SetTitle(fmt.Sprintf("Terminal - %s", title))
+					})
+				}
+			case <-terminal.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	myWindow.ShowAndRun()
+}

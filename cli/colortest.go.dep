@@ -1,0 +1,362 @@
+package main
+
+import (
+	"image/color"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+)
+
+func main() {
+	myApp := app.New()
+	myWindow := myApp.NewWindow("TextGrid Color and Emoji Test")
+	myWindow.Resize(fyne.NewSize(800, 800))
+
+	// Test colors
+	redColor := color.RGBA{0xff, 0x00, 0x00, 0xff}
+	greenColor := color.RGBA{0x00, 0xff, 0x00, 0xff}
+	blueColor := color.RGBA{0x00, 0x00, 0xff, 0xff}
+	yellowColor := color.RGBA{0xff, 0xff, 0x00, 0xff}
+	magentaColor := color.RGBA{0xff, 0x00, 0xff, 0xff}
+	cyanColor := color.RGBA{0x00, 0xff, 0xff, 0xff}
+
+	// Create TextGrid widgets for testing
+
+	// Test 1: Basic TextGrid
+	grid1 := widget.NewTextGrid()
+	grid1.Resize(fyne.NewSize(400, 100))
+
+	// Test 2: TextGrid with custom colors
+	grid2 := widget.NewTextGrid()
+	grid2.Resize(fyne.NewSize(400, 150))
+
+	// Test 3: TextGrid with theme colors
+	grid3 := widget.NewTextGrid()
+	grid3.Resize(fyne.NewSize(400, 150))
+
+	// Test 4: NEW - Emojis with custom colors
+	grid4 := widget.NewTextGrid()
+	grid4.Resize(fyne.NewSize(400, 200))
+
+	// Buttons to test different TextGrid features
+	basicBtn := widget.NewButton("Test Basic TextGrid", func() {
+		// Basic text
+		grid1.SetText("Hello World!\nPlain text in TextGrid\nLine 3")
+	})
+
+	customColorBtn := widget.NewButton("Test Custom Colors", func() {
+		// Try to set custom colors per cell
+		grid2.SetText("") // Clear first
+
+		// Let's try to set individual cell colors
+		text := "Red Green Blue Yellow"
+		grid2.SetText(text)
+
+		// Try to access and modify individual cells
+		// Note: This might not work if TextGrid doesn't support per-cell colors
+		if len(grid2.Rows) > 0 && len(grid2.Rows[0].Cells) >= len(text) {
+			// Try to set colors for individual characters
+			for i, char := range "Red " {
+				if i < len(grid2.Rows[0].Cells) {
+					grid2.Rows[0].Cells[i].Rune = char
+					grid2.Rows[0].Cells[i].Style = &widget.CustomTextGridStyle{
+						FGColor: redColor,
+					}
+				}
+			}
+
+			// Continue with other colors...
+			startIdx := 4
+			for i, char := range "Green " {
+				if startIdx+i < len(grid2.Rows[0].Cells) {
+					grid2.Rows[0].Cells[startIdx+i].Rune = char
+					grid2.Rows[0].Cells[startIdx+i].Style = &widget.CustomTextGridStyle{
+						FGColor: greenColor,
+					}
+				}
+			}
+
+			startIdx = 10
+			for i, char := range "Blue " {
+				if startIdx+i < len(grid2.Rows[0].Cells) {
+					grid2.Rows[0].Cells[startIdx+i].Rune = char
+					grid2.Rows[0].Cells[startIdx+i].Style = &widget.CustomTextGridStyle{
+						FGColor: blueColor,
+					}
+				}
+			}
+
+			startIdx = 15
+			for i, char := range "Yellow" {
+				if startIdx+i < len(grid2.Rows[0].Cells) {
+					grid2.Rows[0].Cells[startIdx+i].Rune = char
+					grid2.Rows[0].Cells[startIdx+i].Style = &widget.CustomTextGridStyle{
+						FGColor: yellowColor,
+					}
+				}
+			}
+
+			grid2.Refresh()
+		}
+	})
+
+	themeColorBtn := widget.NewButton("Test Theme Colors", func() {
+		// Test using theme-based styles
+		grid3.SetText("Theme Colors Test")
+
+		if len(grid3.Rows) > 0 {
+			// Try different theme-based styles
+			if len(grid3.Rows[0].Cells) > 0 {
+				grid3.Rows[0].Cells[0].Style = &widget.CustomTextGridStyle{
+					FGColor: theme.ErrorColor(),
+				}
+			}
+			if len(grid3.Rows[0].Cells) > 6 {
+				grid3.Rows[0].Cells[6].Style = &widget.CustomTextGridStyle{
+					FGColor: theme.SuccessColor(),
+				}
+			}
+			if len(grid3.Rows[0].Cells) > 13 {
+				grid3.Rows[0].Cells[13].Style = &widget.CustomTextGridStyle{
+					FGColor: theme.PrimaryColor(),
+				}
+			}
+
+			grid3.Refresh()
+		}
+	})
+
+	// NEW: Emoji + Color test button
+	emojiColorBtn := widget.NewButton("Test Emojis + Colors", func() {
+		// Test emojis with custom colors
+		grid4.SetText("🔴 Red 🟢 Green 🔵 Blue\n😀 Happy 😢 Sad 😡 Angry\n🚀 Launch 🌟 Star ⚡ Power")
+
+		if len(grid4.Rows) >= 3 {
+			// First row: Color the text after emojis
+			if len(grid4.Rows[0].Cells) > 2 {
+				// Color "Red" in red
+				for i := 2; i < 5 && i < len(grid4.Rows[0].Cells); i++ {
+					if grid4.Rows[0].Cells[i].Style == nil {
+						grid4.Rows[0].Cells[i].Style = &widget.CustomTextGridStyle{}
+					}
+					grid4.Rows[0].Cells[i].Style.(*widget.CustomTextGridStyle).FGColor = redColor
+				}
+			}
+			if len(grid4.Rows[0].Cells) > 8 {
+				// Color "Green" in green
+				for i := 8; i < 13 && i < len(grid4.Rows[0].Cells); i++ {
+					if grid4.Rows[0].Cells[i].Style == nil {
+						grid4.Rows[0].Cells[i].Style = &widget.CustomTextGridStyle{}
+					}
+					grid4.Rows[0].Cells[i].Style.(*widget.CustomTextGridStyle).FGColor = greenColor
+				}
+			}
+			if len(grid4.Rows[0].Cells) > 16 {
+				// Color "Blue" in blue
+				for i := 16; i < 20 && i < len(grid4.Rows[0].Cells); i++ {
+					if grid4.Rows[0].Cells[i].Style == nil {
+						grid4.Rows[0].Cells[i].Style = &widget.CustomTextGridStyle{}
+					}
+					grid4.Rows[0].Cells[i].Style.(*widget.CustomTextGridStyle).FGColor = blueColor
+				}
+			}
+
+			// Second row: Color emotion words
+			if len(grid4.Rows[1].Cells) > 2 {
+				// Color "Happy" in yellow
+				for i := 2; i < 7 && i < len(grid4.Rows[1].Cells); i++ {
+					if grid4.Rows[1].Cells[i].Style == nil {
+						grid4.Rows[1].Cells[i].Style = &widget.CustomTextGridStyle{}
+					}
+					grid4.Rows[1].Cells[i].Style.(*widget.CustomTextGridStyle).FGColor = yellowColor
+				}
+			}
+			if len(grid4.Rows[1].Cells) > 9 {
+				// Color "Sad" in cyan
+				for i := 9; i < 12 && i < len(grid4.Rows[1].Cells); i++ {
+					if grid4.Rows[1].Cells[i].Style == nil {
+						grid4.Rows[1].Cells[i].Style = &widget.CustomTextGridStyle{}
+					}
+					grid4.Rows[1].Cells[i].Style.(*widget.CustomTextGridStyle).FGColor = cyanColor
+				}
+			}
+			if len(grid4.Rows[1].Cells) > 15 {
+				// Color "Angry" in red
+				for i := 15; i < 20 && i < len(grid4.Rows[1].Cells); i++ {
+					if grid4.Rows[1].Cells[i].Style == nil {
+						grid4.Rows[1].Cells[i].Style = &widget.CustomTextGridStyle{}
+					}
+					grid4.Rows[1].Cells[i].Style.(*widget.CustomTextGridStyle).FGColor = redColor
+				}
+			}
+
+			// Third row: Color action words
+			if len(grid4.Rows[2].Cells) > 2 {
+				// Color "Launch" in magenta
+				for i := 2; i < 8 && i < len(grid4.Rows[2].Cells); i++ {
+					if grid4.Rows[2].Cells[i].Style == nil {
+						grid4.Rows[2].Cells[i].Style = &widget.CustomTextGridStyle{}
+					}
+					grid4.Rows[2].Cells[i].Style.(*widget.CustomTextGridStyle).FGColor = magentaColor
+				}
+			}
+			if len(grid4.Rows[2].Cells) > 11 {
+				// Color "Star" in yellow
+				for i := 11; i < 15 && i < len(grid4.Rows[2].Cells); i++ {
+					if grid4.Rows[2].Cells[i].Style == nil {
+						grid4.Rows[2].Cells[i].Style = &widget.CustomTextGridStyle{}
+					}
+					grid4.Rows[2].Cells[i].Style.(*widget.CustomTextGridStyle).FGColor = yellowColor
+				}
+			}
+			if len(grid4.Rows[2].Cells) > 17 {
+				// Color "Power" in cyan
+				for i := 17; i < 22 && i < len(grid4.Rows[2].Cells); i++ {
+					if grid4.Rows[2].Cells[i].Style == nil {
+						grid4.Rows[2].Cells[i].Style = &widget.CustomTextGridStyle{}
+					}
+					grid4.Rows[2].Cells[i].Style.(*widget.CustomTextGridStyle).FGColor = cyanColor
+				}
+			}
+
+			grid4.Refresh()
+		}
+	})
+
+	terminalBtn := widget.NewButton("Terminal Simulation", func() {
+		// Create a terminal-like display
+		grid2.SetText("user@host:~$ ls --color\nfolder1  script.sh  file.txt")
+
+		if len(grid2.Rows) >= 2 {
+			// Color the prompt line
+			promptText := "user@host:~$ "
+			for i := range promptText {
+				if i < len(grid2.Rows[0].Cells) {
+					grid2.Rows[0].Cells[i].Style = &widget.CustomTextGridStyle{
+						FGColor: greenColor,
+					}
+				}
+			}
+
+			// Color the command
+			cmdStart := len(promptText)
+			cmdText := "ls --color"
+			for i := range cmdText {
+				if cmdStart+i < len(grid2.Rows[0].Cells) {
+					grid2.Rows[0].Cells[cmdStart+i].Style = &widget.CustomTextGridStyle{
+						FGColor: color.White,
+					}
+				}
+			}
+
+			// Color the output line
+			if len(grid2.Rows[1].Cells) > 0 {
+				// folder1 in blue
+				for i := 0; i < 7 && i < len(grid2.Rows[1].Cells); i++ {
+					grid2.Rows[1].Cells[i].Style = &widget.CustomTextGridStyle{
+						FGColor: blueColor,
+					}
+				}
+
+				// script.sh in green (executable)
+				for i := 9; i < 18 && i < len(grid2.Rows[1].Cells); i++ {
+					grid2.Rows[1].Cells[i].Style = &widget.CustomTextGridStyle{
+						FGColor: greenColor,
+					}
+				}
+			}
+
+			grid2.Refresh()
+		}
+	})
+
+	clearBtn := widget.NewButton("Clear All", func() {
+		grid1.SetText("")
+		grid2.SetText("")
+		grid3.SetText("")
+		grid4.SetText("")
+	})
+
+	debugBtn := widget.NewButton("Debug TextGrid Structure", func() {
+		// Print debug info about TextGrid structure
+		println("=== TextGrid Debug Info ===")
+		println("Grid2 rows:", len(grid2.Rows))
+		if len(grid2.Rows) > 0 {
+			println("Row 0 cells:", len(grid2.Rows[0].Cells))
+			if len(grid2.Rows[0].Cells) > 0 {
+				println("Cell 0 rune:", string(grid2.Rows[0].Cells[0].Rune))
+				println("Cell 0 has style:", grid2.Rows[0].Cells[0].Style != nil)
+			}
+		}
+
+		// Debug Grid4 (emoji grid)
+		println("Grid4 rows:", len(grid4.Rows))
+		if len(grid4.Rows) > 0 {
+			println("Row 0 cells:", len(grid4.Rows[0].Cells))
+			for i := 0; i < min(5, len(grid4.Rows[0].Cells)); i++ {
+				println("Cell", i, "rune:", string(grid4.Rows[0].Cells[i].Rune))
+			}
+		}
+	})
+
+	// Layout
+	content := container.NewVBox(
+		widget.NewLabel("TextGrid Widget Color and Emoji Support Test"),
+		widget.NewLabel("TextGrid is designed for terminal-like applications - let's test its color and emoji support!"),
+
+		widget.NewSeparator(),
+
+		widget.NewLabel("Test 1: Basic TextGrid"),
+		basicBtn,
+		grid1,
+
+		widget.NewSeparator(),
+
+		widget.NewLabel("Test 2: Custom Colors per Cell"),
+		container.NewHBox(customColorBtn, terminalBtn),
+		grid2,
+
+		widget.NewSeparator(),
+
+		widget.NewLabel("Test 3: Theme Colors"),
+		themeColorBtn,
+		grid3,
+
+		widget.NewSeparator(),
+
+		widget.NewLabel("Test 4: Emojis + Custom Colors (NEW!)"),
+		emojiColorBtn,
+		grid4,
+
+		widget.NewSeparator(),
+
+		container.NewHBox(clearBtn, debugBtn),
+
+		widget.NewSeparator(),
+
+		widget.NewLabel("Expected Results:"),
+		widget.NewLabel("✅ If TextGrid supports per-cell colors: Perfect for terminal!"),
+		widget.NewLabel("🎨 If emojis render with colors: Great for rich terminal UIs!"),
+		widget.NewLabel("❌ If TextGrid only uses theme colors: Limited usefulness"),
+		widget.NewLabel("❓ If TextGrid doesn't support custom colors: Canvas.Text is still best"),
+	)
+
+	scroll := container.NewScroll(content)
+	myWindow.SetContent(scroll)
+
+	// Initialize with some basic content
+	grid1.SetText("Initial text in TextGrid")
+
+	myWindow.ShowAndRun()
+}
+
+// Helper function for Go versions that don't have min built-in
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

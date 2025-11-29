@@ -1,0 +1,1311 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"image/color"
+	"log"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"tetherssh/internal/gopyte"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+	"github.com/creack/pty"
+)
+
+// Color mapping similar to your Python version
+var colorMappings = map[string]color.Color{
+	"black":          color.RGBA{0x00, 0x00, 0x00, 0xff},
+	"red":            color.RGBA{0xff, 0x00, 0x00, 0xff},
+	"green":          color.RGBA{0x00, 0xff, 0x00, 0xff},
+	"yellow":         color.RGBA{0xff, 0xff, 0x00, 0xff},
+	"blue":           color.RGBA{0x00, 0x00, 0xff, 0xff},
+	"magenta":        color.RGBA{0xff, 0x00, 0xff, 0xff},
+	"cyan":           color.RGBA{0x00, 0xff, 0xff, 0xff},
+	"white":          color.RGBA{0xff, 0xff, 0xff, 0xff},
+	"bright_black":   color.RGBA{0x7f, 0x7f, 0x7f, 0xff},
+	"bright_red":     color.RGBA{0xff, 0x5f, 0x5f, 0xff},
+	"bright_green":   color.RGBA{0x5f, 0xff, 0x5f, 0xff},
+	"bright_yellow":  color.RGBA{0xff, 0xff, 0x5f, 0xff},
+	"bright_blue":    color.RGBA{0x5f, 0x5f, 0xff, 0xff},
+	"bright_magenta": color.RGBA{0xff, 0x5f, 0xff, 0xff},
+	"bright_cyan":    color.RGBA{0x5f, 0xff, 0xff, 0xff},
+	"bright_white":   color.RGBA{0xff, 0xff, 0xff, 0xff},
+	"default":        color.RGBA{0xe0, 0xe0, 0xe0, 0xff},
+}
+
+// NativeTheme provides a more native terminal appearance
+type NativeTheme struct {
+	fyne.Theme
+	isDark bool
+}
+
+func NewNativeTheme(dark bool) *NativeTheme {
+	return &NativeTheme{
+		Theme:  theme.DefaultTheme(),
+		isDark: dark,
+	}
+}
+
+func (t *NativeTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNameForeground:
+		if t.isDark {
+			return color.RGBA{0xe0, 0xe0, 0xe0, 0xff}
+		}
+		return color.RGBA{0x2e, 0x34, 0x40, 0xff}
+	case theme.ColorNameBackground:
+		if t.isDark {
+			return color.RGBA{0x1e, 0x1e, 0x1e, 0xff}
+		}
+		return color.RGBA{0xfa, 0xfa, 0xfa, 0xff}
+	case theme.ColorNameSelection:
+		if t.isDark {
+			return color.RGBA{0x44, 0x47, 0x5a, 0x80}
+		}
+		return color.RGBA{0x00, 0x7a, 0xcc, 0x40}
+	case theme.ColorNamePrimary:
+		if t.isDark {
+			return color.RGBA{0x00, 0xd4, 0xaa, 0xff}
+		}
+		return color.RGBA{0x00, 0x78, 0xd4, 0xff}
+	}
+	return t.Theme.Color(name, variant)
+}
+
+func (t *NativeTheme) Font(style fyne.TextStyle) fyne.Resource {
+	return theme.DefaultTheme().Font(style)
+}
+
+// Custom scroll container that intercepts scroll events
+type HistoryScrollContainer struct {
+	*container.Scroll
+	terminal *NativeTerminalWidget
+}
+
+func (h *HistoryScrollContainer) Scrolled(event *fyne.ScrollEvent) {
+	// Let our terminal handle the scroll event first
+	h.terminal.handleScrollEvent(event)
+
+	// Then let the normal scroll container handle it if needed
+	if !h.terminal.screen.IsUsingAlternate() && !h.terminal.isInHistoryMode {
+		h.Scroll.Scrolled(event)
+	}
+}
+
+// NativeTerminalWidget represents our native-looking terminal with history support
+type NativeTerminalWidget struct {
+	widget.BaseWidget
+
+	// Core components - Using WideCharScreen
+	screen   *gopyte.WideCharScreen
+	stream   *gopyte.Stream
+	textGrid *widget.TextGrid
+	scroll   *HistoryScrollContainer
+
+	// PTY handling
+	ptyFile *os.File
+	cmd     *exec.Cmd
+
+	// State management
+	title string
+
+	// Font and sizing
+	fontSize   float32
+	charWidth  float32
+	charHeight float32
+	cols       int
+	rows       int
+
+	// Thread safety and performance
+	mutex         sync.RWMutex
+	updateChannel chan []byte
+	updatePending bool
+
+	// Context for cancellation
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// Size change detection
+	lastWidth   float32
+	lastHeight  float32
+	resizeTimer *time.Timer
+	resizeMutex sync.Mutex
+
+	// Selection support
+	selectionStart fyne.Position
+	selectionEnd   fyne.Position
+	isSelecting    bool
+
+	// Theme
+	theme *NativeTheme
+
+	// Default colors
+	fgColor string
+	bgColor string
+
+	// History navigation state
+	isInHistoryMode    bool
+	maxHistoryLines    int
+	actualHistoryLines []string // Store actual terminal history
+}
+
+// NewNativeTerminalWidget creates a new native-looking terminal emulator with history
+func NewNativeTerminalWidget(darkMode bool) *NativeTerminalWidget {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	t := &NativeTerminalWidget{
+		updateChannel: make(chan []byte, 1000),
+		ctx:           ctx,
+		cancel:        cancel,
+		fontSize:      13.0,
+		cols:          80,
+		rows:          24,
+		title:         "Terminal",
+		theme:         NewNativeTheme(darkMode),
+		fgColor:       "white",
+		bgColor:       "black",
+		// History state
+		isInHistoryMode:    false,
+		maxHistoryLines:    100, // Default to 100 lines of history
+		actualHistoryLines: make([]string, 0),
+	}
+
+	t.calculateCharDimensions()
+
+	// Initialize GoPyte components with configurable history
+	t.screen = gopyte.NewWideCharScreen(t.cols, t.rows, t.maxHistoryLines)
+	t.stream = gopyte.NewStream(t.screen, false)
+
+	// Create TextGrid
+	t.textGrid = widget.NewTextGrid()
+	t.textGrid.ShowLineNumbers = false
+	t.textGrid.ShowWhitespace = false
+
+	// Initialize TextGrid size
+	t.initializeTextGridSize()
+
+	// Create custom scroll container that handles history navigation
+	baseScroll := container.NewScroll(t.textGrid)
+	baseScroll.SetMinSize(fyne.NewSize(600, 400))
+
+	t.scroll = &HistoryScrollContainer{
+		Scroll:   baseScroll,
+		terminal: t,
+	}
+
+	// Start background processing
+	go t.dataProcessor()
+	go t.updateProcessor()
+
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+func (t *NativeTerminalWidget) calculateCharDimensions() {
+	// More accurate character dimension calculations
+	switch runtime.GOOS {
+	case "darwin":
+		t.charWidth = t.fontSize * 0.55
+		t.charHeight = t.fontSize * 1.15
+	case "windows":
+		t.charWidth = t.fontSize * 0.57
+		t.charHeight = t.fontSize * 1.2
+	default:
+		t.charWidth = t.fontSize * 0.56
+		t.charHeight = t.fontSize * 1.22
+	}
+
+	log.Printf("Character dimensions: %.2fx%.2f for fontSize %.1f", t.charWidth, t.charHeight, t.fontSize)
+}
+
+func (t *NativeTerminalWidget) initializeTextGridSize() {
+	initialSize := fyne.NewSize(
+		float32(t.cols)*t.charWidth,
+		float32(t.rows)*t.charHeight,
+	)
+	t.textGrid.Resize(initialSize)
+
+	log.Printf("Initial TextGrid size: %.1fx%.1f for %dx%d terminal",
+		initialSize.Width, initialSize.Height, t.cols, t.rows)
+}
+
+func (t *NativeTerminalWidget) CalculateTerminalSize(width, height float32) (int, int) {
+	if t.charWidth <= 0 || t.charHeight <= 0 {
+		return 80, 24
+	}
+
+	usableWidth := width - 8
+	usableHeight := height
+
+	cols := int(usableWidth / t.charWidth)
+	rows := int(usableHeight / t.charHeight)
+
+	if cols < 10 {
+		cols = 10
+	} else if cols > 500 {
+		cols = 500
+	}
+
+	if rows < 3 {
+		rows = 3
+	} else if rows > 200 {
+		rows = 200
+	}
+
+	log.Printf("CalculateTerminalSize: window=%.1fx%.1f -> %dx%d", width, height, cols, rows)
+	return cols, rows
+}
+
+// CreateRenderer implements fyne.Widget interface
+func (t *NativeTerminalWidget) CreateRenderer() fyne.WidgetRenderer {
+	return &nativeTerminalRenderer{
+		widget: t,
+		scroll: t.scroll,
+	}
+}
+
+type nativeTerminalRenderer struct {
+	widget *NativeTerminalWidget
+	scroll *HistoryScrollContainer
+}
+
+func (r *nativeTerminalRenderer) Layout(size fyne.Size) {
+	r.scroll.Scroll.Resize(size)
+
+	widget := r.widget
+	cols, rows := widget.CalculateTerminalSize(size.Width, size.Height)
+
+	widget.mutex.RLock()
+	currentCols, currentRows := widget.cols, widget.rows
+	needsUpdate := cols != currentCols || rows != currentRows
+	widget.mutex.RUnlock()
+
+	if needsUpdate {
+		log.Printf("Layout: Dimensions changed from %dx%d to %dx%d", currentCols, currentRows, cols, rows)
+
+		textGridSize := fyne.NewSize(
+			float32(cols)*widget.charWidth,
+			float32(rows)*widget.charHeight,
+		)
+
+		widget.textGrid.Resize(textGridSize)
+		widget.handleResize(size.Width, size.Height)
+	} else {
+		textGridSize := fyne.NewSize(
+			float32(cols)*widget.charWidth,
+			float32(rows)*widget.charHeight,
+		)
+		widget.textGrid.Resize(textGridSize)
+	}
+}
+
+func (r *nativeTerminalRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(300, 200)
+}
+
+func (r *nativeTerminalRenderer) Refresh() {
+	r.scroll.Scroll.Refresh()
+}
+
+func (r *nativeTerminalRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.scroll.Scroll}
+}
+
+func (r *nativeTerminalRenderer) Destroy() {}
+
+// ENHANCED KEY HANDLING WITH HISTORY NAVIGATION
+func (t *NativeTerminalWidget) TypedKey(key *fyne.KeyEvent) {
+	if t.ptyFile == nil {
+		return
+	}
+
+	var data []byte
+
+	// Handle history navigation keys
+	switch key.Name {
+	case fyne.KeyPageUp:
+		if !t.screen.IsUsingAlternate() {
+			t.scrollUpInHistory(t.rows / 2)
+			return
+		}
+		data = []byte("\x1b[5~")
+	case fyne.KeyPageDown:
+		if !t.screen.IsUsingAlternate() {
+			t.scrollDownInHistory(t.rows / 2)
+			return
+		}
+		data = []byte("\x1b[6~")
+	case fyne.KeyReturn:
+		// Exit history mode on Enter when in normal mode
+		if !t.screen.IsUsingAlternate() && t.isInHistoryMode {
+			t.exitHistoryMode()
+		}
+		data = []byte("\r")
+	case fyne.KeyTab:
+		data = []byte("\t")
+	case fyne.KeyBackspace:
+		data = []byte("\x7f")
+	case fyne.KeyDelete:
+		data = []byte("\x1b[3~")
+	case fyne.KeyUp:
+		data = []byte("\x1b[A")
+	case fyne.KeyDown:
+		data = []byte("\x1b[B")
+	case fyne.KeyLeft:
+		data = []byte("\x1b[D")
+	case fyne.KeyRight:
+		data = []byte("\x1b[C")
+	case fyne.KeyHome:
+		data = []byte("\x1b[H")
+	case fyne.KeyEnd:
+		data = []byte("\x1b[F")
+	case fyne.KeyEscape:
+		data = []byte("\x1b")
+	case fyne.KeyF1:
+		data = []byte("\x1b[11~")
+	case fyne.KeyF2:
+		data = []byte("\x1b[12~")
+	case fyne.KeyF3:
+		data = []byte("\x1b[13~")
+	case fyne.KeyF4:
+		data = []byte("\x1b[14~")
+	case fyne.KeyF5:
+		data = []byte("\x1b[15~")
+	case fyne.KeyF6:
+		data = []byte("\x1b[17~")
+	case fyne.KeyF7:
+		data = []byte("\x1b[18~")
+	case fyne.KeyF8:
+		data = []byte("\x1b[19~")
+	case fyne.KeyF9:
+		data = []byte("\x1b[20~")
+	case fyne.KeyF10:
+		data = []byte("\x1b[21~")
+	case fyne.KeyF11:
+		data = []byte("\x1b[23~")
+	case fyne.KeyF12:
+		data = []byte("\x1b[24~")
+	}
+
+	if len(data) > 0 {
+		t.WriteToPTY(data)
+
+		// Force update for immediate feedback
+		if t.screen.IsUsingAlternate() {
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				t.updatePending = true
+			}()
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) TypedRune(r rune) {
+	if t.ptyFile == nil {
+		return
+	}
+
+	// Exit history mode on any typing
+	if !t.screen.IsUsingAlternate() && t.isInHistoryMode {
+		t.exitHistoryMode()
+	}
+
+	if r < 32 {
+		data := []byte{byte(r)}
+		t.WriteToPTY(data)
+	} else {
+		data := []byte(string(r))
+		t.WriteToPTY(data)
+	}
+}
+
+func (t *NativeTerminalWidget) Focusable() bool {
+	return true
+}
+
+func (t *NativeTerminalWidget) FocusGained() {}
+
+func (t *NativeTerminalWidget) FocusLost() {}
+
+// ENHANCED MOUSE HANDLING WITH SCROLL WHEEL SUPPORT
+func (t *NativeTerminalWidget) MouseDown(event *desktop.MouseEvent) {
+	t.isSelecting = true
+	t.selectionStart = event.Position
+	t.selectionEnd = event.Position
+}
+
+func (t *NativeTerminalWidget) MouseUp(event *desktop.MouseEvent) {
+	t.isSelecting = false
+}
+
+func (t *NativeTerminalWidget) Dragged(event *fyne.DragEvent) {
+	if t.isSelecting {
+		t.selectionEnd = event.Position
+	}
+}
+
+// Handle scroll wheel events by overriding the scroll container's behavior
+func (t *NativeTerminalWidget) handleScrollEvent(event *fyne.ScrollEvent) {
+	log.Printf("Scroll event: DY=%.2f, using alternate=%v, viewing history=%v",
+		event.Scrolled.DY, t.screen.IsUsingAlternate(), t.isInHistoryMode)
+
+	if t.screen.IsUsingAlternate() {
+		// In alternate screen, let default scroll behavior handle it
+		return
+	}
+
+	// Scroll through history
+	if event.Scrolled.DY > 0 {
+		// Scroll up (into history)
+		t.scrollUpInHistory(3)
+	} else if event.Scrolled.DY < 0 {
+		// Scroll down (towards current)
+		t.scrollDownInHistory(3)
+	}
+}
+
+// UPDATED: History navigation that works with scroll container
+func (t *NativeTerminalWidget) scrollUpInHistory(lines int) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	historySize := len(t.actualHistoryLines)
+	log.Printf("Scroll up request: %d lines, history size: %d", lines, historySize)
+
+	if historySize == 0 {
+		log.Printf("No history to scroll through")
+		return
+	}
+
+	// Instead of using GoPyte's scroll methods, we'll control the scroll container directly
+	t.isInHistoryMode = true
+	t.updatePending = true
+
+	// Calculate where to scroll in the TextGrid
+	// We want to scroll up by 'lines' worth of content
+	currentOffset := t.scroll.Scroll.Offset.Y
+	lineHeight := t.charHeight
+	newOffset := currentOffset - (float32(lines) * lineHeight)
+
+	if newOffset < 0 {
+		newOffset = 0
+	}
+
+	log.Printf("Scrolling up: current offset %.1f -> %.1f", currentOffset, newOffset)
+
+	// Use Fyne's scroll container to control the view
+	go func() {
+		time.Sleep(10 * time.Millisecond) // Brief delay for UI update
+		fyne.Do(func() {
+			t.scroll.Scroll.Scrolled(&fyne.ScrollEvent{
+				Scrolled: fyne.Delta{DX: 0, DY: newOffset - currentOffset},
+			})
+		})
+	}()
+}
+
+func (t *NativeTerminalWidget) scrollDownInHistory(lines int) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	log.Printf("Scroll down request: %d lines", lines)
+
+	// Calculate where to scroll in the TextGrid
+	currentOffset := t.scroll.Scroll.Offset.Y
+	lineHeight := t.charHeight
+	newOffset := currentOffset + (float32(lines) * lineHeight)
+
+	// Get the maximum scrollable distance
+	contentHeight := t.textGrid.Size().Height
+	viewportHeight := t.scroll.Scroll.Size().Height
+	maxOffset := contentHeight - viewportHeight
+
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+
+	if newOffset > maxOffset {
+		newOffset = maxOffset
+		// If we've scrolled to the bottom, exit history mode
+		t.isInHistoryMode = false
+	}
+
+	log.Printf("Scrolling down: current offset %.1f -> %.1f (max %.1f)", currentOffset, newOffset, maxOffset)
+
+	t.updatePending = true
+
+	// Use Fyne's scroll container to control the view
+	go func() {
+		time.Sleep(10 * time.Millisecond) // Brief delay for UI update
+		fyne.Do(func() {
+			t.scroll.Scroll.Scrolled(&fyne.ScrollEvent{
+				Scrolled: fyne.Delta{DX: 0, DY: newOffset - currentOffset},
+			})
+		})
+	}()
+}
+
+func (t *NativeTerminalWidget) exitHistoryMode() {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	t.isInHistoryMode = false
+	t.updatePending = true
+
+	log.Printf("Exited history mode - scrolling to bottom")
+
+	// Scroll to bottom to show current content
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		fyne.Do(func() {
+			t.scroll.Scroll.ScrollToBottom()
+		})
+	}()
+}
+
+// Size handling
+func (t *NativeTerminalWidget) handleResize(width, height float32) {
+	t.resizeMutex.Lock()
+	defer t.resizeMutex.Unlock()
+
+	if width == t.lastWidth && height == t.lastHeight {
+		return
+	}
+
+	t.lastWidth = width
+	t.lastHeight = height
+
+	if t.resizeTimer != nil {
+		t.resizeTimer.Stop()
+	}
+
+	t.resizeTimer = time.AfterFunc(150*time.Millisecond, func() {
+		t.performResize(width, height)
+	})
+}
+
+func (t *NativeTerminalWidget) performResize(width, height float32) {
+	newCols, newRows := t.CalculateTerminalSize(width, height)
+
+	t.mutex.Lock()
+	currentCols, currentRows := t.cols, t.rows
+	needsResize := newCols != currentCols || newRows != currentRows
+
+	if needsResize {
+		log.Printf("Resizing from %dx%d to %dx%d", currentCols, currentRows, newCols, newRows)
+
+		t.cols = newCols
+		t.rows = newRows
+
+		// Resize gopyte screen
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Error resizing screen: %v", r)
+				}
+			}()
+			t.screen.Resize(newCols, newRows)
+		}()
+
+		fyne.Do(func() {
+			t.textGrid.Resize(fyne.NewSize(
+				float32(newCols)*t.charWidth,
+				float32(newRows)*t.charHeight,
+			))
+			t.textGrid.Refresh()
+		})
+	}
+	t.mutex.Unlock()
+
+	if needsResize {
+		go func() {
+			if t.ptyFile != nil {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("Error resizing PTY: %v", r)
+						}
+					}()
+
+					time.Sleep(50 * time.Millisecond)
+
+					pty.Setsize(t.ptyFile, &pty.Winsize{
+						Rows: uint16(newRows),
+						Cols: uint16(newCols),
+					})
+				}()
+			}
+
+			if t.screen.IsUsingAlternate() && t.cmd != nil && t.cmd.Process != nil {
+				if runtime.GOOS != "windows" {
+					time.Sleep(100 * time.Millisecond)
+					t.cmd.Process.Signal(os.Signal(syscall.SIGWINCH))
+				}
+
+				time.Sleep(150 * time.Millisecond)
+				t.WriteToPTY([]byte("\x0c"))
+			}
+
+			t.updatePending = true
+			time.Sleep(100 * time.Millisecond)
+			t.updatePending = true
+		}()
+	}
+}
+
+// Enhanced PTY management
+func (t *NativeTerminalWidget) StartShell() error {
+	var shell string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		shell = "powershell.exe"
+		args = []string{"-NoLogo"}
+	case "darwin":
+		shell = os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/zsh"
+		}
+	default:
+		shell = os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/bash"
+		}
+	}
+
+	cmd := exec.Command(shell, args...)
+
+	cmd.Env = append(os.Environ(),
+		"TERM=xterm-256color",
+		"COLORTERM=truecolor",
+		"FORCE_COLOR=1",
+		"CLICOLOR=1",
+		"CLICOLOR_FORCE=1",
+		fmt.Sprintf("COLUMNS=%d", t.cols),
+		fmt.Sprintf("LINES=%d", t.rows),
+		"LC_ALL=C.UTF-8",
+		"LANG=C.UTF-8",
+	)
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd.Env = append(cmd.Env, "ANSICON=1")
+	case "darwin":
+		cmd.Env = append(cmd.Env, "TERM_PROGRAM=Terminal")
+	}
+
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to start shell: %v", err)
+	}
+
+	t.ptyFile = ptmx
+	t.cmd = cmd
+
+	pty.Setsize(ptmx, &pty.Winsize{
+		Rows: uint16(t.rows),
+		Cols: uint16(t.cols),
+	})
+
+	go t.readFromPTY()
+	return nil
+}
+
+func (t *NativeTerminalWidget) readFromPTY() {
+	buffer := make([]byte, 4096)
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		default:
+			n, err := t.ptyFile.Read(buffer)
+			if err != nil {
+				if !strings.Contains(err.Error(), "file already closed") {
+					log.Printf("PTY read error: %v", err)
+				}
+				return
+			}
+
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buffer[:n])
+
+				select {
+				case t.updateChannel <- data:
+				case <-t.ctx.Done():
+					return
+				default:
+				}
+			}
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) dataProcessor() {
+	for {
+		select {
+		case data := <-t.updateChannel:
+			t.processTerminalData(data)
+		case <-t.ctx.Done():
+			return
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) processTerminalData(data []byte) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	// Exit history mode when new data arrives (unless in alternate screen)
+	if !t.screen.IsUsingAlternate() && t.isInHistoryMode {
+		t.isInHistoryMode = false
+		// Don't call screen.ScrollToBottom() here - let the redraw handle positioning
+	}
+
+	// Capture lines that are about to scroll off the screen for our history
+	if !t.screen.IsUsingAlternate() {
+		currentDisplay := t.screen.GetDisplay()
+		if len(currentDisplay) > 0 {
+			// Check if we're about to scroll (cursor at bottom)
+			_, cursorY := t.screen.GetCursor()
+			if cursorY >= t.rows-1 {
+				// Add current top lines to history before they scroll off
+				for i := 0; i < len(currentDisplay) && i < 5; i++ { // Save a few lines
+					line := strings.TrimRight(currentDisplay[i], " ")
+					if line != "" && !strings.HasPrefix(line, "History line") {
+						t.addLineToHistory(line)
+					}
+				}
+			}
+		}
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Error feeding data to stream: %v", r)
+			}
+		}()
+		t.stream.Feed(string(data))
+	}()
+
+	dataStr := string(data)
+	t.handleEscapeSequences(dataStr)
+	t.updatePending = true
+
+	if strings.Contains(dataStr, "\x1b]0;") {
+		t.extractWindowTitle(dataStr)
+	}
+}
+
+// Add line to our local history buffer
+func (t *NativeTerminalWidget) addLineToHistory(line string) {
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+
+	t.actualHistoryLines = append(t.actualHistoryLines, line)
+
+	// Trim history if it exceeds maximum
+	if len(t.actualHistoryLines) > t.maxHistoryLines {
+		// Remove oldest lines
+		excess := len(t.actualHistoryLines) - t.maxHistoryLines
+		t.actualHistoryLines = t.actualHistoryLines[excess:]
+	}
+
+	log.Printf("Added line to history: '%s' (total: %d)", line, len(t.actualHistoryLines))
+}
+
+// REMOVED: Manual escape sequence handling - GoPyte handles this automatically
+func (t *NativeTerminalWidget) handleEscapeSequences(data string) {
+	// Window title extraction
+	if strings.Contains(data, "\x1b]0;") {
+		t.extractWindowTitle(data)
+	}
+}
+
+func (t *NativeTerminalWidget) extractWindowTitle(data string) {
+	start := strings.Index(data, "\x1b]0;")
+	if start >= 0 {
+		start += 4
+		end := strings.IndexAny(data[start:], "\x07\x1b")
+		if end >= 0 {
+			t.title = data[start : start+end]
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) updateProcessor() {
+	ticker := time.NewTicker(16 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if t.updatePending {
+				t.performRedraw()
+				t.updatePending = false
+			}
+		case <-t.ctx.Done():
+			return
+		}
+	}
+}
+
+// CORRECTED: Use actual captured history instead of placeholder
+func (t *NativeTerminalWidget) performRedraw() {
+	t.mutex.RLock()
+
+	var allLines []string
+	var allAttrs [][]gopyte.Attributes
+
+	if t.screen.IsUsingAlternate() {
+		// ALTERNATE SCREEN: Show only current screen content
+		allLines = t.screen.GetDisplay()
+		allAttrs = t.screen.GetAttributes()
+	} else {
+		// NORMAL MODE: Combine actual history + current content for scrolling
+
+		// Get current screen content
+		currentLines := t.screen.GetDisplay()
+		currentAttrs := t.screen.GetAttributes()
+
+		// Use our captured history instead of placeholder
+		if len(t.actualHistoryLines) > 0 {
+			// Create attributes for history lines (default styling)
+			historyAttrs := make([][]gopyte.Attributes, len(t.actualHistoryLines))
+			for i, line := range t.actualHistoryLines {
+				historyAttrs[i] = make([]gopyte.Attributes, len(line))
+				for j := range historyAttrs[i] {
+					historyAttrs[i][j] = gopyte.Attributes{Fg: "default", Bg: "default"}
+				}
+			}
+
+			// Combine history + current
+			allLines = append(t.actualHistoryLines, currentLines...)
+			allAttrs = append(historyAttrs, currentAttrs...)
+		} else {
+			// No history yet, just current content
+			allLines = currentLines
+			allAttrs = currentAttrs
+		}
+	}
+
+	log.Printf("Redraw: %d total lines (%d history + %d current), using alternate=%v, viewing history=%v",
+		len(allLines), len(t.actualHistoryLines), len(t.screen.GetDisplay()),
+		t.screen.IsUsingAlternate(), t.isInHistoryMode)
+
+	// Determine scroll behavior
+	shouldAutoScroll := !t.screen.IsUsingAlternate() && !t.isInHistoryMode
+
+	t.mutex.RUnlock()
+
+	fyne.Do(func() {
+		t.redrawTextGrid(allLines, allAttrs)
+
+		if shouldAutoScroll {
+			// Scroll to bottom to show latest content
+			t.scroll.Scroll.ScrollToBottom()
+		} else if t.screen.IsUsingAlternate() {
+			// In alternate screen, always show from top
+			t.scroll.Scroll.ScrollToTop()
+		}
+		// When viewing history, maintain current scroll position (don't auto-scroll)
+	})
+}
+
+func (t *NativeTerminalWidget) extractScreenContent() []string {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Error extracting screen content: %v", r)
+		}
+	}()
+
+	display := t.screen.GetDisplay()
+	return display
+}
+
+func (t *NativeTerminalWidget) extractScreenAttributes() [][]gopyte.Attributes {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Error extracting screen attributes: %v", r)
+		}
+	}()
+
+	return t.screen.GetAttributes()
+}
+
+func (t *NativeTerminalWidget) redrawTextGrid(combinedLines []string, combinedAttrs [][]gopyte.Attributes) {
+	if len(combinedLines) == 0 {
+		t.textGrid.SetText("")
+		return
+	}
+
+	// CRITICAL: Always size TextGrid to show ALL content for proper scrolling
+	totalLines := len(combinedLines)
+	targetHeight := float32(totalLines) * t.charHeight
+
+	// Ensure minimum height even with little content
+	minHeight := float32(t.rows) * t.charHeight
+	if targetHeight < minHeight {
+		targetHeight = minHeight
+	}
+
+	t.textGrid.Resize(fyne.NewSize(
+		float32(t.cols)*t.charWidth,
+		targetHeight,
+	))
+
+	log.Printf("TextGrid sized to %.1fx%.1f for %d lines (min height: %.1f)",
+		float32(t.cols)*t.charWidth, targetHeight, totalLines, minHeight)
+
+	modifiedLines := make([]string, len(combinedLines))
+	copy(modifiedLines, combinedLines)
+
+	// Handle alternate screen sizing
+	if t.screen.IsUsingAlternate() {
+		if len(modifiedLines) < t.rows {
+			for len(modifiedLines) < t.rows {
+				modifiedLines = append(modifiedLines, "")
+			}
+		} else if len(modifiedLines) > t.rows {
+			modifiedLines = modifiedLines[:t.rows]
+		}
+
+		for i := range modifiedLines {
+			runes := []rune(modifiedLines[i])
+			if len(runes) < t.cols {
+				padding := strings.Repeat(" ", t.cols-len(runes))
+				modifiedLines[i] = modifiedLines[i] + padding
+			} else if len(runes) > t.cols {
+				modifiedLines[i] = string(runes[:t.cols])
+			}
+		}
+	}
+
+	// Get cursor position
+	cursorX, cursorY := t.screen.GetCursor()
+
+	// Cursor positioning logic
+	var adjustedCursorY int
+	var shouldShowCursor bool = true
+
+	if t.screen.IsUsingAlternate() {
+		adjustedCursorY = cursorY
+		if cursorY >= 0 && cursorY < len(modifiedLines) && cursorX >= 0 && cursorX < t.cols {
+			shouldShowCursor = true
+		} else {
+			shouldShowCursor = false
+		}
+	} else {
+		// In normal mode, don't show cursor when viewing history
+		if t.isInHistoryMode {
+			shouldShowCursor = false
+		} else {
+			// Find the actual typing line
+			actualTypingLine := -1
+			for i := len(modifiedLines) - 1; i >= 0; i-- {
+				trimmed := strings.TrimSpace(modifiedLines[i])
+				if trimmed != "" && !strings.HasPrefix(trimmed, "~") {
+					actualTypingLine = i
+					break
+				}
+			}
+
+			if actualTypingLine >= 0 {
+				adjustedCursorY = actualTypingLine
+			} else {
+				adjustedCursorY = cursorY
+			}
+		}
+	}
+
+	// Place cursor
+	if shouldShowCursor && adjustedCursorY >= 0 && adjustedCursorY < len(modifiedLines) && cursorX >= 0 {
+		currentLine := modifiedLines[adjustedCursorY]
+
+		if cursorX < len([]rune(currentLine)) {
+			runes := []rune(currentLine)
+			if cursorX < len(runes) {
+				runes[cursorX] = '█'
+				modifiedLines[adjustedCursorY] = string(runes)
+			}
+		} else {
+			runes := []rune(currentLine)
+			padding := strings.Repeat(" ", cursorX-len(runes))
+			modifiedLines[adjustedCursorY] = currentLine + padding + "█"
+		}
+	}
+
+	// Set text and apply colors
+	fullText := strings.Join(modifiedLines, "\n")
+	t.textGrid.SetText(fullText)
+	t.applyColorsToTextGrid(modifiedLines, combinedAttrs)
+}
+
+// Apply colors to individual cells in the TextGrid
+func (t *NativeTerminalWidget) applyColorsToTextGrid(lines []string, attrs [][]gopyte.Attributes) {
+	if len(t.textGrid.Rows) == 0 {
+		return
+	}
+
+	for rowIdx, line := range lines {
+		if rowIdx >= len(t.textGrid.Rows) || rowIdx >= len(attrs) {
+			break
+		}
+
+		t.applyLineColorsFromAttributes(rowIdx, line, attrs[rowIdx])
+	}
+
+	t.textGrid.Refresh()
+}
+
+func (t *NativeTerminalWidget) applyLineColorsFromAttributes(rowIdx int, line string, lineAttrs []gopyte.Attributes) {
+	if rowIdx >= len(t.textGrid.Rows) {
+		return
+	}
+
+	row := t.textGrid.Rows[rowIdx]
+	runes := []rune(line)
+
+	for charIdx, char := range runes {
+		if charIdx >= len(row.Cells) || charIdx >= len(lineAttrs) {
+			break
+		}
+
+		attr := lineAttrs[charIdx]
+
+		if row.Cells[charIdx].Style == nil {
+			row.Cells[charIdx].Style = &widget.CustomTextGridStyle{}
+		}
+
+		style := row.Cells[charIdx].Style.(*widget.CustomTextGridStyle)
+
+		if fgColor := t.mapGopyteColorToFyne(attr.Fg); fgColor != nil {
+			style.FGColor = fgColor
+		}
+
+		if bgColor := t.mapGopyteColorToFyne(attr.Bg); bgColor != nil {
+			style.BGColor = bgColor
+		}
+
+		if attr.Bold {
+			if brightColor := t.makeBrighter(style.FGColor); brightColor != nil {
+				style.FGColor = brightColor
+			}
+		}
+
+		row.Cells[charIdx].Rune = char
+	}
+}
+
+func (t *NativeTerminalWidget) mapGopyteColorToFyne(colorName string) color.Color {
+	if colorName == "" || colorName == "default" {
+		return nil
+	}
+
+	if fyneColor, exists := colorMappings[colorName]; exists {
+		return fyneColor
+	}
+
+	if strings.HasPrefix(colorName, "color") {
+		return colorMappings["white"]
+	}
+
+	switch colorName {
+	case "brown":
+		return colorMappings["yellow"]
+	default:
+		return colorMappings["white"]
+	}
+}
+
+func (t *NativeTerminalWidget) makeBrighter(c color.Color) color.Color {
+	if c == nil {
+		return nil
+	}
+
+	r, g, b, a := c.RGBA()
+	r8, g8, b8, a8 := uint8(r>>8), uint8(g>>8), uint8(b>>8), uint8(a>>8)
+
+	brighten := uint8(40)
+
+	newR := r8
+	if r8 < 255-brighten {
+		newR = r8 + brighten
+	} else {
+		newR = 255
+	}
+
+	newG := g8
+	if g8 < 255-brighten {
+		newG = g8 + brighten
+	} else {
+		newG = 255
+	}
+
+	newB := b8
+	if b8 < 255-brighten {
+		newB = b8 + brighten
+	} else {
+		newB = 255
+	}
+
+	return color.RGBA{newR, newG, newB, a8}
+}
+
+// Public API methods
+func (t *NativeTerminalWidget) WriteToPTY(data []byte) error {
+	if t.ptyFile != nil {
+		_, err := t.ptyFile.Write(data)
+		return err
+	}
+	return fmt.Errorf("PTY not initialized")
+}
+
+func (t *NativeTerminalWidget) GetTitle() string {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	return t.title
+}
+
+func (t *NativeTerminalWidget) Clear() {
+	t.WriteToPTY([]byte("\x1b[2J\x1b[H"))
+}
+
+// NEW: Public methods for history control
+func (t *NativeTerminalWidget) GetHistorySize() int {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	return len(t.actualHistoryLines)
+}
+
+func (t *NativeTerminalWidget) IsInHistoryMode() bool {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	return t.isInHistoryMode
+}
+
+func (t *NativeTerminalWidget) ScrollToTop() {
+	if !t.screen.IsUsingAlternate() {
+		historySize := t.GetHistorySize()
+		if historySize > 0 {
+			t.scrollUpInHistory(historySize)
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) ScrollToBottom() {
+	if !t.screen.IsUsingAlternate() {
+		t.exitHistoryMode()
+	}
+}
+
+// NEW: Method to set maximum history lines
+func (t *NativeTerminalWidget) SetMaxHistoryLines(maxLines int) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	t.maxHistoryLines = maxLines
+
+	// Trim existing history if needed
+	if len(t.actualHistoryLines) > maxLines {
+		excess := len(t.actualHistoryLines) - maxLines
+		t.actualHistoryLines = t.actualHistoryLines[excess:]
+	}
+
+	log.Printf("Set max history lines to %d (current: %d)", maxLines, len(t.actualHistoryLines))
+}
+
+func (t *NativeTerminalWidget) TestColors() {
+	colorTest := "\x1b[31mRed\x1b[0m \x1b[32mGreen\x1b[0m \x1b[33mYellow\x1b[0m \x1b[34mBlue\x1b[0m \x1b[35mMagenta\x1b[0m \x1b[36mCyan\x1b[0m\n"
+	brightTest := "\x1b[91mBright Red\x1b[0m \x1b[92mBright Green\x1b[0m \x1b[93mBright Yellow\x1b[0m \x1b[94mBright Blue\x1b[0m\n"
+	formatTest := "\x1b[1mBold\x1b[0m Normal\n"
+	emojiTest := "🔴 Red Circle 🟢 Green Circle 🔵 Blue Circle\n"
+
+	fullTest := colorTest + brightTest + formatTest + emojiTest + "Test completed!\n"
+	t.WriteToPTY([]byte(fullTest))
+}
+
+func (t *NativeTerminalWidget) Close() {
+	t.cancel()
+
+	t.resizeMutex.Lock()
+	if t.resizeTimer != nil {
+		t.resizeTimer.Stop()
+	}
+	t.resizeMutex.Unlock()
+
+	if t.ptyFile != nil {
+		t.ptyFile.Close()
+	}
+
+	if t.cmd != nil && t.cmd.Process != nil {
+		t.cmd.Process.Kill()
+	}
+}
+
+// Main application
+func main() {
+	myApp := app.New()
+
+	darkMode := true
+	myApp.Settings().SetTheme(NewNativeTheme(darkMode))
+
+	myWindow := myApp.NewWindow("Terminal")
+	myWindow.Resize(fyne.NewSize(1000, 700))
+
+	// Create terminal widget with custom history size
+	terminal := NewNativeTerminalWidget(darkMode)
+	terminal.SetMaxHistoryLines(100) // Set to 100 lines as requested
+
+	if err := terminal.StartShell(); err != nil {
+		log.Fatal("Failed to start shell:", err)
+	}
+
+	content := container.NewBorder(nil, nil, nil, nil, terminal)
+	myWindow.SetContent(content)
+
+	myWindow.SetCloseIntercept(func() {
+		terminal.Close()
+		myApp.Quit()
+	})
+
+	myWindow.Canvas().Focus(terminal)
+
+	// Update window title dynamically
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				title := terminal.GetTitle()
+				if title != "" && title != "Terminal" {
+					fyne.Do(func() {
+						myWindow.SetTitle(fmt.Sprintf("Terminal - %s", title))
+					})
+				}
+			case <-terminal.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	myWindow.ShowAndRun()
+}

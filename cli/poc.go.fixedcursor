@@ -1,0 +1,825 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"image/color"
+	"log"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"tetherssh/internal/gopyte"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+	"github.com/creack/pty"
+)
+
+// NativeTheme provides a more native terminal appearance
+type NativeTheme struct {
+	fyne.Theme
+	isDark bool
+}
+
+func NewNativeTheme(dark bool) *NativeTheme {
+	return &NativeTheme{
+		Theme:  theme.DefaultTheme(),
+		isDark: dark,
+	}
+}
+
+func (t *NativeTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNameForeground:
+		if t.isDark {
+			return color.RGBA{0xe0, 0xe0, 0xe0, 0xff} // Light gray for dark theme
+		}
+		return color.RGBA{0x2e, 0x34, 0x40, 0xff} // Dark blue-gray for light theme
+	case theme.ColorNameBackground:
+		if t.isDark {
+			return color.RGBA{0x1e, 0x1e, 0x1e, 0xff} // Almost black
+		}
+		return color.RGBA{0xfa, 0xfa, 0xfa, 0xff} // Almost white
+	case theme.ColorNameSelection:
+		if t.isDark {
+			return color.RGBA{0x44, 0x47, 0x5a, 0x80} // Semi-transparent blue
+		}
+		return color.RGBA{0x00, 0x7a, 0xcc, 0x40}
+	case theme.ColorNamePrimary:
+		if t.isDark {
+			return color.RGBA{0x00, 0xd4, 0xaa, 0xff} // Cyan-green
+		}
+		return color.RGBA{0x00, 0x78, 0xd4, 0xff} // Blue
+	}
+	return t.Theme.Color(name, variant)
+}
+
+func (t *NativeTheme) Font(style fyne.TextStyle) fyne.Resource {
+	// Use system monospace font for better native appearance
+	return theme.DefaultTheme().Font(style)
+}
+
+// NativeTerminalWidget represents our native-looking terminal
+type NativeTerminalWidget struct {
+	widget.BaseWidget
+
+	// Core components
+	screen   *gopyte.WideCharScreen
+	stream   *gopyte.Stream
+	richText *widget.RichText
+	scroll   *container.Scroll
+
+	// PTY handling
+	ptyFile *os.File
+	cmd     *exec.Cmd
+
+	// State management
+	inAlternateScreen bool
+	scrollbackBuffer  []string
+	maxScrollbackSize int
+	title             string
+
+	// Font and sizing
+	fontSize   float32
+	charWidth  float32
+	charHeight float32
+	cols       int
+	rows       int
+
+	// Thread safety and performance
+	mutex         sync.RWMutex
+	updateChannel chan []byte
+	updatePending bool
+
+	// Context for cancellation
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// Size change detection
+	lastWidth   float32
+	lastHeight  float32
+	resizeTimer *time.Timer
+	resizeMutex sync.Mutex
+
+	// Selection support
+	selectionStart fyne.Position
+	selectionEnd   fyne.Position
+	isSelecting    bool
+
+	// Theme
+	theme *NativeTheme
+}
+
+// NewNativeTerminalWidget creates a new native-looking terminal emulator
+func NewNativeTerminalWidget(darkMode bool) *NativeTerminalWidget {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	t := &NativeTerminalWidget{
+		maxScrollbackSize: 10000, // Larger scrollback for better UX
+		updateChannel:     make(chan []byte, 1000),
+		ctx:               ctx,
+		cancel:            cancel,
+		fontSize:          13.0, // Slightly larger for better readability
+		cols:              80,
+		rows:              24,
+		title:             "Terminal",
+		theme:             NewNativeTheme(darkMode),
+	}
+
+	// Calculate character dimensions with better accuracy
+	t.calculateCharDimensions()
+
+	// Initialize GoPyte components
+	t.screen = gopyte.NewWideCharScreen(t.cols, t.rows, t.maxScrollbackSize)
+	t.stream = gopyte.NewStream(t.screen, false)
+
+	// Create optimized Fyne components
+	t.richText = widget.NewRichText()
+	t.richText.Wrapping = fyne.TextWrapOff
+
+	t.scroll = container.NewScroll(t.richText)
+	t.scroll.SetMinSize(fyne.NewSize(600, 400))
+
+	// Start background processing
+	go t.dataProcessor()
+	go t.updateProcessor()
+
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+func (t *NativeTerminalWidget) calculateCharDimensions() {
+	// More precise calculations for different platforms
+	switch runtime.GOOS {
+	case "darwin": // macOS
+		t.charWidth = t.fontSize * 0.6
+		t.charHeight = t.fontSize * 1.35
+	case "windows":
+		t.charWidth = t.fontSize * 0.62
+		t.charHeight = t.fontSize * 1.4
+	default: // Linux and others
+		t.charWidth = t.fontSize * 0.61
+		t.charHeight = t.fontSize * 1.38
+	}
+}
+
+func (t *NativeTerminalWidget) CalculateTerminalSize(width, height float32) (int, int) {
+	if t.charWidth <= 0 || t.charHeight <= 0 {
+		return 80, 24
+	}
+
+	// More accurate size calculations
+	usableWidth := width - 15  // Account for scrollbar
+	usableHeight := height - 5 // Account for borders
+
+	cols := int(usableWidth / t.charWidth)
+	rows := int(usableHeight / t.charHeight)
+
+	// Reasonable bounds
+	if cols < 10 {
+		cols = 10
+	} else if cols > 300 {
+		cols = 300
+	}
+
+	if rows < 3 {
+		rows = 3
+	} else if rows > 150 {
+		rows = 150
+	}
+
+	return cols, rows
+}
+
+// CreateRenderer implements fyne.Widget interface
+func (t *NativeTerminalWidget) CreateRenderer() fyne.WidgetRenderer {
+	return &nativeTerminalRenderer{
+		widget: t,
+		scroll: t.scroll,
+	}
+}
+
+type nativeTerminalRenderer struct {
+	widget *NativeTerminalWidget
+	scroll *container.Scroll
+}
+
+func (r *nativeTerminalRenderer) Layout(size fyne.Size) {
+	r.scroll.Resize(size)
+	r.widget.handleResize(size.Width, size.Height)
+}
+
+func (r *nativeTerminalRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(300, 200)
+}
+
+func (r *nativeTerminalRenderer) Refresh() {
+	r.scroll.Refresh()
+}
+
+func (r *nativeTerminalRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.scroll}
+}
+
+func (r *nativeTerminalRenderer) Destroy() {}
+
+// Keyboard and mouse event handling
+func (t *NativeTerminalWidget) TypedKey(key *fyne.KeyEvent) {
+	if t.ptyFile == nil {
+		return
+	}
+
+	var data []byte
+
+	switch key.Name {
+	case fyne.KeyReturn:
+		data = []byte("\r")
+	case fyne.KeyTab:
+		data = []byte("\t")
+	case fyne.KeyBackspace:
+		data = []byte("\x7f")
+	case fyne.KeyDelete:
+		data = []byte("\x1b[3~")
+	case fyne.KeyUp:
+		data = []byte("\x1b[A")
+	case fyne.KeyDown:
+		data = []byte("\x1b[B")
+	case fyne.KeyLeft:
+		data = []byte("\x1b[D")
+	case fyne.KeyRight:
+		data = []byte("\x1b[C")
+	case fyne.KeyHome:
+		data = []byte("\x1b[H")
+	case fyne.KeyEnd:
+		data = []byte("\x1b[F")
+	case fyne.KeyPageUp:
+		data = []byte("\x1b[5~")
+	case fyne.KeyPageDown:
+		data = []byte("\x1b[6~")
+	case fyne.KeyEscape:
+		data = []byte("\x1b")
+	case fyne.KeyF1:
+		data = []byte("\x1b[11~")
+	case fyne.KeyF2:
+		data = []byte("\x1b[12~")
+	case fyne.KeyF3:
+		data = []byte("\x1b[13~")
+	case fyne.KeyF4:
+		data = []byte("\x1b[14~")
+	case fyne.KeyF5:
+		data = []byte("\x1b[15~")
+	case fyne.KeyF6:
+		data = []byte("\x1b[17~")
+	case fyne.KeyF7:
+		data = []byte("\x1b[18~")
+	case fyne.KeyF8:
+		data = []byte("\x1b[19~")
+	case fyne.KeyF9:
+		data = []byte("\x1b[20~")
+	case fyne.KeyF10:
+		data = []byte("\x1b[21~")
+	case fyne.KeyF11:
+		data = []byte("\x1b[23~")
+	case fyne.KeyF12:
+		data = []byte("\x1b[24~")
+	}
+
+	if len(data) > 0 {
+		t.WriteToPTY(data)
+	}
+}
+
+func (t *NativeTerminalWidget) TypedRune(r rune) {
+	if t.ptyFile == nil {
+		return
+	}
+
+	// Handle Ctrl+C and other control characters
+	if r < 32 {
+		data := []byte{byte(r)}
+		t.WriteToPTY(data)
+	} else {
+		data := []byte(string(r))
+		t.WriteToPTY(data)
+	}
+}
+
+func (t *NativeTerminalWidget) Focusable() bool {
+	return true
+}
+
+func (t *NativeTerminalWidget) FocusGained() {
+	// Terminal gained focus - could show cursor or change appearance
+}
+
+func (t *NativeTerminalWidget) FocusLost() {
+	// Terminal lost focus - could hide cursor or dim appearance
+}
+
+// Mouse events for selection (basic implementation)
+func (t *NativeTerminalWidget) MouseDown(event *desktop.MouseEvent) {
+	t.isSelecting = true
+	t.selectionStart = event.Position
+	t.selectionEnd = event.Position
+}
+
+func (t *NativeTerminalWidget) MouseUp(event *desktop.MouseEvent) {
+	t.isSelecting = false
+	// Handle selection completion
+}
+
+func (t *NativeTerminalWidget) Dragged(event *fyne.DragEvent) {
+	if t.isSelecting {
+		t.selectionEnd = event.Position
+		// Update selection display
+	}
+}
+
+// Size handling with improved debouncing
+func (t *NativeTerminalWidget) handleResize(width, height float32) {
+	t.resizeMutex.Lock()
+	defer t.resizeMutex.Unlock()
+
+	if width == t.lastWidth && height == t.lastHeight {
+		return
+	}
+
+	t.lastWidth = width
+	t.lastHeight = height
+
+	if t.resizeTimer != nil {
+		t.resizeTimer.Stop()
+	}
+
+	// Faster resize response for better UX
+	t.resizeTimer = time.AfterFunc(150*time.Millisecond, func() {
+		t.performResize(width, height)
+	})
+}
+
+func (t *NativeTerminalWidget) performResize(width, height float32) {
+	newCols, newRows := t.CalculateTerminalSize(width, height)
+
+	t.mutex.Lock()
+	currentCols, currentRows := t.cols, t.rows
+	needsResize := newCols != currentCols || newRows != currentRows
+
+	if needsResize {
+		t.cols = newCols
+		t.rows = newRows
+	}
+	t.mutex.Unlock()
+
+	if needsResize {
+		go func() {
+			// Safely resize components
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("Error resizing screen: %v", r)
+					}
+				}()
+				t.screen.Resize(newCols, newRows)
+			}()
+
+			if t.ptyFile != nil {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("Error resizing PTY: %v", r)
+						}
+					}()
+					pty.Setsize(t.ptyFile, &pty.Winsize{
+						Rows: uint16(newRows),
+						Cols: uint16(newCols),
+					})
+				}()
+			}
+
+			t.updatePending = true
+		}()
+	}
+}
+
+// Enhanced PTY management
+func (t *NativeTerminalWidget) StartShell() error {
+	var shell string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		shell = "powershell.exe"
+		args = []string{"-NoLogo"}
+	case "darwin":
+		shell = os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/zsh" // Default to zsh on macOS
+		}
+	default:
+		shell = os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/bash"
+		}
+	}
+
+	cmd := exec.Command(shell, args...)
+
+	// Set up environment
+	cmd.Env = append(os.Environ(),
+		"TERM=xterm-256color",
+		fmt.Sprintf("COLUMNS=%d", t.cols),
+		fmt.Sprintf("LINES=%d", t.rows),
+	)
+
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to start shell: %v", err)
+	}
+
+	t.ptyFile = ptmx
+	t.cmd = cmd
+
+	// Set initial PTY size
+	pty.Setsize(ptmx, &pty.Winsize{
+		Rows: uint16(t.rows),
+		Cols: uint16(t.cols),
+	})
+
+	go t.readFromPTY()
+	return nil
+}
+
+func (t *NativeTerminalWidget) readFromPTY() {
+	buffer := make([]byte, 4096) // Larger buffer for better performance
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		default:
+			n, err := t.ptyFile.Read(buffer)
+			if err != nil {
+				if !strings.Contains(err.Error(), "file already closed") {
+					log.Printf("PTY read error: %v", err)
+				}
+				return
+			}
+
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buffer[:n])
+
+				select {
+				case t.updateChannel <- data:
+				case <-t.ctx.Done():
+					return
+				default:
+					// Channel full, continue (prevents blocking)
+				}
+			}
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) dataProcessor() {
+	for {
+		select {
+		case data := <-t.updateChannel:
+			t.processTerminalData(data)
+		case <-t.ctx.Done():
+			return
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) processTerminalData(data []byte) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Error feeding data to stream: %v", r)
+			}
+		}()
+		t.stream.Feed(string(data))
+	}()
+
+	// Handle special sequences
+	dataStr := string(data)
+	t.handleEscapeSequences(dataStr)
+	t.updatePending = true
+
+	// Update window title if escape sequence detected
+	if strings.Contains(dataStr, "\x1b]0;") {
+		t.extractWindowTitle(dataStr)
+	}
+}
+
+func (t *NativeTerminalWidget) handleEscapeSequences(data string) {
+	// Enhanced alternate screen detection
+	if strings.Contains(data, "\x1b[?1049h") || strings.Contains(data, "\x1b[?47h") {
+		if !t.inAlternateScreen {
+			t.preserveCurrentScreen()
+			t.inAlternateScreen = true
+			go func() {
+				time.Sleep(100 * time.Millisecond) // Small delay
+				fyne.Do(func() {
+					t.scroll.ScrollToBottom()
+				})
+			}()
+		}
+	}
+
+	if strings.Contains(data, "\x1b[?1049l") || strings.Contains(data, "\x1b[?47l") {
+		t.inAlternateScreen = false
+	}
+}
+
+func (t *NativeTerminalWidget) extractWindowTitle(data string) {
+	// Extract title from OSC sequences: \x1b]0;title\x07
+	start := strings.Index(data, "\x1b]0;")
+	if start >= 0 {
+		start += 4
+		end := strings.IndexAny(data[start:], "\x07\x1b")
+		if end >= 0 {
+			t.title = data[start : start+end]
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) preserveCurrentScreen() {
+	currentContent := t.extractScreenContent()
+	for _, line := range currentContent {
+		if strings.TrimSpace(line) != "" {
+			t.addToScrollback(line)
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) addToScrollback(line string) {
+	t.scrollbackBuffer = append(t.scrollbackBuffer, line)
+	if len(t.scrollbackBuffer) > t.maxScrollbackSize {
+		removeCount := len(t.scrollbackBuffer) - t.maxScrollbackSize
+		t.scrollbackBuffer = t.scrollbackBuffer[removeCount:]
+	}
+}
+
+// Enhanced update processor with better throttling
+func (t *NativeTerminalWidget) updateProcessor() {
+	ticker := time.NewTicker(16 * time.Millisecond) // ~60fps for smooth updates
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if t.updatePending {
+				t.performRedraw()
+				t.updatePending = false
+			}
+		case <-t.ctx.Done():
+			return
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) performRedraw() {
+	t.mutex.RLock()
+
+	var combinedLines []string
+	if t.inAlternateScreen {
+		combinedLines = t.extractScreenContent()
+	} else {
+		combinedLines = make([]string, len(t.scrollbackBuffer))
+		copy(combinedLines, t.scrollbackBuffer)
+		currentContent := t.extractScreenContent()
+		combinedLines = append(combinedLines, currentContent...)
+	}
+
+	segments := t.createRichTextSegments(combinedLines)
+	shouldAutoScroll := !t.inAlternateScreen
+
+	t.mutex.RUnlock()
+
+	// Update UI on main thread
+	fyne.Do(func() {
+		t.richText.Segments = segments
+		t.richText.Refresh()
+
+		if shouldAutoScroll {
+			t.scroll.ScrollToBottom()
+		}
+	})
+}
+
+func (t *NativeTerminalWidget) extractScreenContent() []string {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Error extracting screen content: %v", r)
+		}
+	}()
+
+	display := t.screen.GetDisplay()
+	lines := make([]string, len(display))
+
+	for i, line := range display {
+		// Keep the original line without trimming - this preserves spacing
+		lines[i] = line
+	}
+
+	return lines
+}
+
+// Add this debug to your createRichTextSegments function:
+
+func (t *NativeTerminalWidget) createRichTextSegments(lines []string) []widget.RichTextSegment {
+	var segments []widget.RichTextSegment
+
+	if len(lines) == 0 {
+		return segments
+	}
+
+	// Get cursor position from GoPyte
+	cursorX, cursorY := t.screen.GetCursor()
+
+	// DEBUG: Find the ACTUAL line with content (where user is typing)
+	var actualTypingLine = -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed != "" && !strings.HasPrefix(trimmed, "~") {
+			actualTypingLine = i
+			break
+		}
+	}
+
+	log.Printf("=== CURSOR OFFSET DEBUG ===")
+	log.Printf("GoPyte cursor: Y=%d, X=%d", cursorY, cursorX)
+	log.Printf("Actual typing line found at: %d", actualTypingLine)
+	log.Printf("Offset between cursor and typing: %d lines", actualTypingLine-cursorY)
+	log.Printf("Total lines from GoPyte: %d", len(lines))
+	log.Printf("Using alternate screen: %v", t.inAlternateScreen)
+
+	// Show all non-empty lines with their indices
+	log.Printf("Non-empty lines:")
+	for i := 0; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed != "" {
+			marker := "   "
+			if i == cursorY {
+				marker = "CUR"
+			}
+			if i == actualTypingLine {
+				marker += "*"
+			}
+			log.Printf("  Line %d %s: %q", i, marker, trimmed)
+		}
+	}
+
+	// EXPERIMENTAL: Adjust cursor Y to match actual typing line
+	adjustedCursorY := cursorY
+	if actualTypingLine >= 0 && actualTypingLine != cursorY {
+		log.Printf("EXPERIMENTAL: Adjusting cursor from Y=%d to Y=%d", cursorY, actualTypingLine)
+		adjustedCursorY = actualTypingLine
+	}
+
+	modifiedLines := make([]string, len(lines))
+	copy(modifiedLines, lines)
+
+	// Use adjusted cursor position
+	if cursorX >= 0 && adjustedCursorY >= 0 && adjustedCursorY < len(modifiedLines) {
+		currentLine := strings.TrimRight(modifiedLines[adjustedCursorY], " ")
+
+		// Apply cursor at adjusted position
+		if cursorX >= 0 && cursorX < len(currentLine) {
+			modifiedLines[adjustedCursorY] = currentLine[:cursorX] + "|" + currentLine[cursorX+1:]
+			log.Printf("CURSOR: Placed at adjusted Y=%d X=%d", adjustedCursorY, cursorX)
+		} else if cursorX >= len(currentLine) && cursorX <= len(currentLine)+5 {
+			padding := strings.Repeat(" ", cursorX-len(currentLine))
+			modifiedLines[adjustedCursorY] = currentLine + padding + "|"
+			log.Printf("CURSOR: Extended line at adjusted Y=%d X=%d", adjustedCursorY, cursorX)
+		}
+	} else {
+		log.Printf("CURSOR: Hiding - invalid adjusted coordinates X=%d Y=%d", cursorX, adjustedCursorY)
+	}
+
+	// Rest of function stays the same...
+	var allText strings.Builder
+	for i, line := range modifiedLines {
+		allText.WriteString(line)
+		if i < len(modifiedLines)-1 {
+			allText.WriteString("\n")
+		}
+	}
+
+	text := allText.String()
+	segments = append(segments, &widget.TextSegment{
+		Text: text,
+		Style: widget.RichTextStyle{
+			ColorName: theme.ColorNameForeground,
+			TextStyle: fyne.TextStyle{Monospace: true},
+		},
+	})
+
+	return segments
+}
+
+// Public API methods
+func (t *NativeTerminalWidget) WriteToPTY(data []byte) error {
+	if t.ptyFile != nil {
+		_, err := t.ptyFile.Write(data)
+		return err
+	}
+	return fmt.Errorf("PTY not initialized")
+}
+
+func (t *NativeTerminalWidget) GetTitle() string {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	return t.title
+}
+
+func (t *NativeTerminalWidget) Clear() {
+	t.WriteToPTY([]byte("\x1b[2J\x1b[H"))
+}
+
+func (t *NativeTerminalWidget) Close() {
+	t.cancel()
+
+	t.resizeMutex.Lock()
+	if t.resizeTimer != nil {
+		t.resizeTimer.Stop()
+	}
+	t.resizeMutex.Unlock()
+
+	if t.ptyFile != nil {
+		t.ptyFile.Close()
+	}
+
+	if t.cmd != nil && t.cmd.Process != nil {
+		t.cmd.Process.Kill()
+	}
+}
+
+// Main application
+func main() {
+	myApp := app.New()
+
+	// Detect system theme preference
+	darkMode := true // Default to dark, could be detected from system
+
+	myApp.Settings().SetTheme(NewNativeTheme(darkMode))
+
+	myWindow := myApp.NewWindow("Terminal")
+	myWindow.Resize(fyne.NewSize(1000, 700))
+
+	// Create terminal widget
+	terminal := NewNativeTerminalWidget(darkMode)
+
+	// Start the shell
+	if err := terminal.StartShell(); err != nil {
+		log.Fatal("Failed to start shell:", err)
+	}
+
+	// Create a simple container with the terminal
+	content := container.NewBorder(nil, nil, nil, nil, terminal)
+	myWindow.SetContent(content)
+
+	// Set up window event handling
+	myWindow.SetCloseIntercept(func() {
+		terminal.Close()
+		myApp.Quit()
+	})
+
+	// Focus the terminal for keyboard input
+	myWindow.Canvas().Focus(terminal)
+
+	// Update window title dynamically
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				title := terminal.GetTitle()
+				if title != "" && title != "Terminal" {
+					fyne.Do(func() {
+						myWindow.SetTitle(fmt.Sprintf("Terminal - %s", title))
+					})
+				}
+			case <-terminal.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	myWindow.ShowAndRun()
+}

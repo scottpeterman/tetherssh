@@ -1,0 +1,148 @@
+# TetherSSH Sessions File
+# Edit with the Session Manager (gear icon) or manually
+#
+# Auth types: password, publickey, keyboard-interactive
+# Key path supports ~ expansion (e.g., ~/.ssh/id_rsa)
+#
+# Format is compatible with termtel sessions.yaml
+
+- folder_name: Examples
+  sessions:
+    - display_name: t1000-keyauth
+      host: 10.0.0.108
+      port: "22"
+      username: speterman
+      auth_type: publickey
+      key_path: ~/.ssh/id_rsa
+      DeviceType: linux
+    - display_name: t1k-password
+      host: 10.0.0.108
+      port: "22"
+      username: speterman
+      auth_type: password
+      key_path: /home/speterman/.ssh/id_rsa
+      DeviceType: linux
+- folder_name: Lab
+  sessions: []
+- folder_name: Production
+  sessions: []
+- folder_name: Home
+  sessions:
+    - display_name: T1000
+      host: 10.0.0.108
+      port: "22"
+      auth_type: password
+      DeviceType: linux
+      Model: Thinkstation
+      Vendor: Lenovo
+      credsid: "1"
+- folder_name: Lab-ENG
+  sessions:
+    - display_name: eng-rtr-1
+      host: 172.16.2.1
+      port: "22"
+      auth_type: password
+      DeviceType: cisco_ios
+      Model: IOSv
+      Vendor: Cisco
+      credsid: "1"
+    - display_name: eng-spine-1
+      host: 172.16.2.2
+      port: "22"
+      auth_type: password
+      DeviceType: arista_eos
+      Model: vEOS-lab
+      Vendor: Arista
+      credsid: "1"
+    - display_name: eng-spine-2
+      host: 172.16.2.6
+      port: "22"
+      auth_type: password
+      DeviceType: arista_eos
+      Model: vEOS-lab
+      Vendor: Arista
+      credsid: "1"
+    - display_name: eng-leaf-1
+      host: 172.16.11.41
+      port: "22"
+      auth_type: password
+      DeviceType: cisco_ios
+      Model: IOSv
+      Vendor: Cisco
+      credsid: "1"
+    - display_name: eng-leaf-2
+      host: 172.16.11.42
+      port: "22"
+      auth_type: password
+      DeviceType: cisco_ios
+      Model: IOSv
+      Vendor: Cisco
+      credsid: "1"
+    - display_name: eng-leaf-3
+      host: 172.16.11.43
+      port: "22"
+      auth_type: password
+      DeviceType: cisco_ios
+      Model: IOSv
+      Vendor: Cisco
+      credsid: "1"
+- folder_name: Lab-WAN
+  sessions:
+    - display_name: wan-core-1
+      host: 172.16.128.1
+      port: "22"
+      auth_type: password
+      DeviceType: cisco_ios
+      Model: 7206VXR
+      Vendor: Cisco
+      credsid: "1"
+- folder_name: Lab-USA
+  sessions:
+    - display_name: usa-rtr-1
+      host: 172.16.100.2
+      port: "22"
+      auth_type: password
+      DeviceType: cisco_ios
+      Model: IOSv
+      Vendor: Cisco
+      credsid: "1"
+    - display_name: usa-spine-1
+      host: 172.16.10.2
+      port: "22"
+      auth_type: password
+      DeviceType: arista_eos
+      Model: vEOS-lab
+      Vendor: Arista
+      credsid: "1"
+    - display_name: usa-spine-2
+      host: 172.16.1.6
+      port: "22"
+      auth_type: password
+      DeviceType: arista_eos
+      Model: vEOS-lab
+      Vendor: Arista
+      credsid: "1"
+    - display_name: usa-leaf-1
+      host: 172.16.10.21
+      port: "22"
+      auth_type: password
+      DeviceType: cisco_ios
+      Model: IOSv
+      Vendor: Cisco
+      credsid: "1"
+    - display_name: usa-leaf-2
+      host: 172.16.10.22
+      port: "22"
+      auth_type: password
+      DeviceType: cisco_ios
+      Model: IOSv
+      Vendor: Cisco
+      credsid: "1"
+    - display_name: usa-leaf-3
+      host: 172.16.10.23
+      port: "22"
+      auth_type: password
+      DeviceType: cisco_ios
+      Model: IOSv
+      Vendor: Cisco
+      credsid: "1"

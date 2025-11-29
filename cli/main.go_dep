@@ -1,0 +1,220 @@
+package main
+
+import (
+	"fmt"
+	"image/color"
+	"log"
+	"runtime"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
+)
+
+
+// Color mapping for terminal colors
+var colorMappings = map[string]color.Color{
+	"black":          color.RGBA{0x00, 0x00, 0x00, 0xff},
+	"red":            color.RGBA{0xff, 0x00, 0x00, 0xff},
+	"green":          color.RGBA{0x00, 0xff, 0x00, 0xff},
+	"yellow":         color.RGBA{0xff, 0xff, 0x00, 0xff},
+	"blue":           color.RGBA{0x00, 0x00, 0xff, 0xff},
+	"magenta":        color.RGBA{0xff, 0x00, 0xff, 0xff},
+	"cyan":           color.RGBA{0x00, 0xff, 0xff, 0xff},
+	"white":          color.RGBA{0xff, 0xff, 0xff, 0xff},
+	"bright_black":   color.RGBA{0x7f, 0x7f, 0x7f, 0xff},
+	"bright_red":     color.RGBA{0xff, 0x5f, 0x5f, 0xff},
+	"bright_green":   color.RGBA{0x5f, 0xff, 0x5f, 0xff},
+	"bright_yellow":  color.RGBA{0xff, 0xff, 0x5f, 0xff},
+	"bright_blue":    color.RGBA{0x5f, 0x5f, 0xff, 0xff},
+	"bright_magenta": color.RGBA{0xff, 0x5f, 0xff, 0xff},
+	"bright_cyan":    color.RGBA{0x5f, 0xff, 0xff, 0xff},
+	"bright_white":   color.RGBA{0xff, 0xff, 0xff, 0xff},
+	"default":        color.RGBA{0xe0, 0xe0, 0xe0, 0xff},
+}
+
+// NativeTheme provides a more native terminal appearance
+type NativeTheme struct {
+	fyne.Theme
+	isDark bool
+}
+
+func NewNativeTheme(dark bool) *NativeTheme {
+	return &NativeTheme{
+		Theme:  theme.DefaultTheme(),
+		isDark: dark,
+	}
+}
+
+func (t *NativeTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNameForeground:
+		if t.isDark {
+			return color.RGBA{0xe0, 0xe0, 0xe0, 0xff}
+		}
+		return color.RGBA{0x2e, 0x34, 0x40, 0xff}
+	case theme.ColorNameBackground:
+		if t.isDark {
+			return color.RGBA{0x1e, 0x1e, 0x1e, 0xff}
+		}
+		return color.RGBA{0xfa, 0xfa, 0xfa, 0xff}
+	case theme.ColorNameSelection:
+		if t.isDark {
+			return color.RGBA{0x44, 0x47, 0x5a, 0x80}
+		}
+		return color.RGBA{0x00, 0x7a, 0xcc, 0x40}
+	case theme.ColorNamePrimary:
+		if t.isDark {
+			return color.RGBA{0x00, 0xd4, 0xaa, 0xff}
+		}
+		return color.RGBA{0x00, 0x78, 0xd4, 0xff}
+	}
+	return t.Theme.Color(name, variant)
+}
+
+func (t *NativeTheme) Font(style fyne.TextStyle) fyne.Resource {
+	return theme.DefaultTheme().Font(style)
+}
+
+// Main application entry point
+func main() {
+	log.Printf("Starting terminal application on %s", runtime.GOOS)
+
+	myApp := app.New()
+
+	// Set up theme
+	darkMode := true
+	myApp.Settings().SetTheme(NewNativeTheme(darkMode))
+
+	// Create main window
+	myWindow := myApp.NewWindow(fmt.Sprintf("Terminal - %s", runtime.GOOS))
+	myWindow.Resize(fyne.NewSize(1000, 700))
+
+	// Create terminal widget with virtual scrolling support
+	terminal := NewNativeTerminalWidget(darkMode)
+	terminal.SetMaxHistoryLines(2000) // Limited for testing
+
+	// Start the shell
+	if err := terminal.StartShell(); err != nil {
+		log.Fatal("Failed to start shell:", err)
+	}
+
+	// Create main content layout
+	content := container.NewBorder(nil, nil, nil, nil, terminal)
+	myWindow.SetContent(content)
+
+	// Set up global key capture for focus management
+	myWindow.Canvas().SetOnTypedKey(func(key *fyne.KeyEvent) {
+		fmt.Printf("Window received key: %s (focused widget: %v)\n", key.Name, myWindow.Canvas().Focused())
+
+		// Handle global shortcuts first
+		if handleGlobalShortcuts(key, terminal, myWindow) {
+			return
+		}
+
+		// If terminal doesn't have focus, give it focus and handle the key
+		if myWindow.Canvas().Focused() != terminal {
+			fmt.Printf("Terminal not focused, focusing now\n")
+			myWindow.Canvas().Focus(terminal)
+			}
+
+		// Always forward to terminal
+		terminal.TypedKey(key)
+	})
+
+	// Set up window close handling
+	myWindow.SetCloseIntercept(func() {
+		log.Printf("Application closing, cleaning up...")
+		terminal.Close()
+		myApp.Quit()
+	})
+
+	// Force initial focus to terminal
+	go func() {
+		time.Sleep(100 * time.Millisecond) // Let window fully initialize
+		fyne.Do(func() {
+			fmt.Printf("Forcing initial focus to terminal\n")
+			myWindow.Canvas().Focus(terminal)
+
+			// Verify focus worked
+			focused := myWindow.Canvas().Focused()
+			fmt.Printf("After focusing: focused widget = %v, is terminal = %v\n",
+				focused, focused == terminal)
+		})
+	}()
+
+	// Update window title dynamically based on terminal content
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		baseTitle := fmt.Sprintf("Terminal - %s", runtime.GOOS)
+
+		for {
+			select {
+			case <-ticker.C:
+				title := terminal.GetTitle()
+				if title != "" && title != "Terminal" {
+					fyne.Do(func() {
+						myWindow.SetTitle(fmt.Sprintf("%s - %s", baseTitle, title))
+					})
+				}
+			case <-terminal.GetContext().Done():
+				return
+			}
+		}
+	}()
+
+	// Show and run the application
+	log.Printf("Showing window and starting main loop...")
+	myWindow.ShowAndRun()
+}
+
+// Handle global application shortcuts - SIMPLIFIED for your Fyne version
+func handleGlobalShortcuts(key *fyne.KeyEvent, terminal *NativeTerminalWidget, window fyne.Window) bool {
+	// Function keys that don't require modifiers
+	switch key.Name {
+	case fyne.KeyF1:
+		// F1 for help/debug
+		log.Printf("F1 pressed - showing debug state")
+		// go terminal.DebugEventState()
+		return true
+	case fyne.KeyF5:
+		// F5 to refresh/clear
+		log.Printf("F5 pressed - clearing terminal")
+		terminal.Clear()
+		return true
+	case fyne.KeyF12:
+		// F12 for color test
+		log.Printf("F12 pressed - running color test")
+		go terminal.TestColors()
+		return true
+	}
+
+	// Platform-specific close shortcuts
+	switch runtime.GOOS {
+	case "darwin":
+		// On macOS, Cmd+Q would be handled by the OS
+		// We'll just handle basic cases here
+		break
+	case "windows":
+		// Alt+F4 is handled by Windows
+		// We'll handle Ctrl+W for window close
+		if key.Name == fyne.KeyW {
+			log.Printf("Ctrl+W style close requested")
+			window.Close()
+			return true
+		}
+	default:
+		// Linux - Ctrl+Q
+		if key.Name == fyne.KeyQ {
+			log.Printf("Ctrl+Q style quit requested")
+			window.Close()
+			return true
+		}
+	}
+
+	return false // Shortcut not handled
+}

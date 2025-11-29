@@ -1,0 +1,365 @@
+package main
+
+import (
+	"fmt"
+	"image/color"
+	"strings"
+	"time"
+
+	"tetherssh/internal/gopyte"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/widget"
+)
+
+// DISPLAY RENDERING AND UPDATE LOGIC
+
+// OPTIMIZED updateProcessor with debounced updates
+func (t *NativeTerminalWidget) updateProcessor() {
+	ticker := time.NewTicker(33 * time.Millisecond) // ~30 FPS instead of 60
+	defer ticker.Stop()
+
+	var lastUpdateTime time.Time
+	updateCooldown := 16 * time.Millisecond // Minimum time between updates
+
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			if t.updatePending && now.Sub(lastUpdateTime) >= updateCooldown {
+				t.performRedraw()
+				t.updatePending = false
+				lastUpdateTime = now
+			}
+		case <-t.ctx.Done():
+			return
+		}
+	}
+}
+
+func (t *NativeTerminalWidget) performRedraw() {
+	t.mutex.RLock()
+
+	// CRITICAL: Cache these expensive calls ONCE per redraw cycle
+	// Don't call them multiple times - each call is expensive with history
+	allLines := t.screen.GetDisplay()
+	allAttrs := t.screen.GetAttributes()
+	isViewingHistory := t.IsInHistoryMode()
+	isUsingAlternate := t.screen.IsUsingAlternate()
+
+	t.mutex.RUnlock()
+
+	// Only log when in special modes to reduce spam
+	// REMOVED: Regular logging that was causing performance issues
+
+	// Determine scroll behavior
+	shouldAutoScroll := !isUsingAlternate && !isViewingHistory
+
+	// Get cursor information for display
+	cursorX, cursorY, shouldShowCursor := t.getCursorForDisplayCached(isViewingHistory, isUsingAlternate)
+
+	go func() {
+		fyne.Do(func() {
+			t.redrawTextGrid(allLines, allAttrs, shouldAutoScroll, cursorX, cursorY, shouldShowCursor)
+		})
+	}()
+}
+
+func (t *NativeTerminalWidget) getCursorForDisplayCached(isViewingHistory, isUsingAlternate bool) (int, int, bool) {
+	if t.screen == nil {
+		return 0, 0, false
+	}
+
+	// Get cursor position once
+	cursorX, cursorY := t.screen.GetCursor()
+
+	// Never show cursor when viewing history
+	if isViewingHistory {
+		return 0, 0, false
+	}
+
+	// In alternate screen mode, trust the cursor position exactly
+	if isUsingAlternate {
+		// Validate bounds for alternate screen
+		if cursorY >= 0 && cursorY < t.rows && cursorX >= 0 && cursorX < t.cols {
+			return cursorX, cursorY, true
+		}
+		return 0, 0, false
+	}
+
+	// Normal mode - calculate cursor position considering recent history context
+	historySize := t.GetHistorySize()
+
+	if historySize > 0 {
+		// We might be showing recent history for context
+		// Calculate how much recent history we're showing
+		allLines := t.screen.GetDisplay()
+		currentScreenLines := t.rows
+
+		if len(allLines) > currentScreenLines {
+			// We're showing recent history - cursor needs offset
+			recentHistoryShown := len(allLines) - currentScreenLines
+			adjustedCursorY := cursorY + recentHistoryShown
+
+			if adjustedCursorY >= 0 && adjustedCursorY < len(allLines) && cursorX >= 0 && cursorX < t.cols {
+				return cursorX, adjustedCursorY, true
+			}
+		} else {
+			// No recent history shown - use raw cursor position
+			if cursorY >= 0 && cursorY < len(allLines) && cursorX >= 0 && cursorX < t.cols {
+				return cursorX, cursorY, true
+			}
+		}
+	} else {
+		// No history - use raw cursor position
+		if cursorY >= 0 && cursorY < t.rows && cursorX >= 0 && cursorX < t.cols {
+			return cursorX, cursorY, true
+		}
+	}
+
+	return 0, 0, false
+}
+
+func (t *NativeTerminalWidget) redrawTextGrid(allLines []string, allAttrs [][]gopyte.Attributes, shouldAutoScroll bool, cursorX, cursorY int, shouldShowCursor bool) {
+	if len(allLines) == 0 {
+		t.textGrid.SetText("")
+		return
+	}
+
+	totalLines := len(allLines)
+
+	// SMART SIZING based on mode
+	var contentHeight float32
+	var needsScrollToBottom bool
+	fmt.Print(needsScrollToBottom)
+
+	if t.IsInHistoryMode() {
+		// Viewing history - size for all content, don't auto-scroll
+		contentHeight = float32(totalLines) * t.charHeight
+		needsScrollToBottom = false
+	} else {
+		// Normal typing mode - handle scrollable content
+		if totalLines > t.rows {
+			// Content is longer than screen - size for all content but auto-scroll to bottom
+			contentHeight = float32(totalLines) * t.charHeight
+			needsScrollToBottom = true
+		} else {
+			// Content fits on screen - size for current screen
+			contentHeight = float32(t.rows) * t.charHeight
+			needsScrollToBottom = false
+		}
+	}
+
+	// Only resize if dimensions actually changed
+	currentSize := t.textGrid.Size()
+	newSize := fyne.NewSize(float32(t.cols)*t.charWidth, contentHeight)
+	if currentSize.Width != newSize.Width || currentSize.Height != newSize.Height {
+		t.textGrid.Resize(newSize)
+	}
+
+	// Prepare lines for display (reuse slice to reduce allocations)
+	if cap(t.cachedLines) < len(allLines) {
+		t.cachedLines = make([]string, len(allLines))
+	} else {
+		t.cachedLines = t.cachedLines[:len(allLines)]
+	}
+	copy(t.cachedLines, allLines)
+
+	// Handle alternate screen sizing efficiently
+	if t.screen.IsUsingAlternate() {
+		t.padLinesForAlternateScreen(t.cachedLines)
+	}
+
+	// Place cursor efficiently
+	if shouldShowCursor && cursorY >= 0 && cursorY < len(t.cachedLines) && cursorX >= 0 {
+		t.placeCursorInLineFast(&t.cachedLines[cursorY], cursorX)
+	}
+
+	// Set text content
+	fullText := strings.Join(t.cachedLines, "\n")
+	t.textGrid.SetText(fullText)
+
+	// Apply colors only if we have them
+	if len(allAttrs) > 0 {
+		t.applyColorsToTextGrid(t.cachedLines, allAttrs)
+	}
+
+	// FIXED: Update scroll bar position to match history state
+	if t.scroll != nil {
+		go func() {
+			time.Sleep(5 * time.Millisecond) // Small delay for UI update
+			fyne.Do(func() {
+				t.scroll.UpdateScrollPosition()
+			})
+		}()
+	}
+
+	fmt.Printf("redrawTextGrid: contentHeight=%.1f, totalLines=%d, shouldAutoScroll=%v\n",
+		contentHeight, totalLines, shouldAutoScroll)
+}
+
+// Optimized alternate screen padding
+func (t *NativeTerminalWidget) padLinesForAlternateScreen(lines []string) {
+	targetRows := t.rows
+
+	// Pad to exact number of rows
+	for len(lines) < targetRows {
+		lines = append(lines, "")
+	}
+	if len(lines) > targetRows {
+		lines = lines[:targetRows]
+	}
+
+	// Pad each line to exact width
+	for i := range lines {
+		runes := []rune(lines[i])
+		if len(runes) < t.cols {
+			padding := strings.Repeat(" ", t.cols-len(runes))
+			lines[i] = lines[i] + padding
+		} else if len(runes) > t.cols {
+			lines[i] = string(runes[:t.cols])
+		}
+	}
+}
+
+// Optimized cursor placement
+func (t *NativeTerminalWidget) placeCursorInLineFast(line *string, cursorX int) {
+	if line == nil || cursorX < 0 {
+		return
+	}
+
+	currentLine := *line
+	runes := []rune(currentLine)
+
+	if cursorX < len(runes) {
+		// Replace character at cursor position
+		runes[cursorX] = '█'
+		*line = string(runes)
+	} else if cursorX < t.cols {
+		// Extend line with spaces and place cursor
+		padLen := cursorX - len(runes)
+		if padLen > 0 {
+			padding := strings.Repeat(" ", padLen)
+			*line = currentLine + padding + "█"
+		} else {
+			*line = currentLine + "█"
+		}
+	}
+}
+
+// Apply colors to individual cells in the TextGrid
+func (t *NativeTerminalWidget) applyColorsToTextGrid(lines []string, attrs [][]gopyte.Attributes) {
+	if len(t.textGrid.Rows) == 0 {
+		return
+	}
+
+	// Skip color application if we don't have attributes or they don't match
+	if len(attrs) == 0 || len(attrs) != len(lines) {
+		t.textGrid.Refresh()
+		return
+	}
+
+	for rowIdx, line := range lines {
+		if rowIdx >= len(t.textGrid.Rows) || rowIdx >= len(attrs) {
+			break
+		}
+
+		t.applyLineColorsFromAttributes(rowIdx, line, attrs[rowIdx])
+	}
+
+	t.textGrid.Refresh()
+}
+
+func (t *NativeTerminalWidget) applyLineColorsFromAttributes(rowIdx int, line string, lineAttrs []gopyte.Attributes) {
+	if rowIdx >= len(t.textGrid.Rows) {
+		return
+	}
+
+	row := t.textGrid.Rows[rowIdx]
+	runes := []rune(line)
+
+	for charIdx, char := range runes {
+		if charIdx >= len(row.Cells) || charIdx >= len(lineAttrs) {
+			break
+		}
+
+		attr := lineAttrs[charIdx]
+
+		if row.Cells[charIdx].Style == nil {
+			row.Cells[charIdx].Style = &widget.CustomTextGridStyle{}
+		}
+
+		style := row.Cells[charIdx].Style.(*widget.CustomTextGridStyle)
+
+		if fgColor := t.mapGopyteColorToFyne(attr.Fg); fgColor != nil {
+			style.FGColor = fgColor
+		}
+
+		if bgColor := t.mapGopyteColorToFyne(attr.Bg); bgColor != nil {
+			style.BGColor = bgColor
+		}
+
+		if attr.Bold {
+			if brightColor := t.makeBrighter(style.FGColor); brightColor != nil {
+				style.FGColor = brightColor
+			}
+		}
+
+		row.Cells[charIdx].Rune = char
+	}
+}
+
+func (t *NativeTerminalWidget) mapGopyteColorToFyne(colorName string) color.Color {
+	if colorName == "" || colorName == "default" {
+		return nil
+	}
+
+	if fyneColor, exists := colorMappings[colorName]; exists {
+		return fyneColor
+	}
+
+	if strings.HasPrefix(colorName, "color") {
+		return colorMappings["white"]
+	}
+
+	switch colorName {
+	case "brown":
+		return colorMappings["yellow"]
+	default:
+		return colorMappings["white"]
+	}
+}
+
+func (t *NativeTerminalWidget) makeBrighter(c color.Color) color.Color {
+	if c == nil {
+		return nil
+	}
+
+	r, g, b, a := c.RGBA()
+	r8, g8, b8, a8 := uint8(r>>8), uint8(g>>8), uint8(b>>8), uint8(a>>8)
+
+	brighten := uint8(40)
+
+	newR := r8
+	if r8 < 255-brighten {
+		newR = r8 + brighten
+	} else {
+		newR = 255
+	}
+
+	newG := g8
+	if g8 < 255-brighten {
+		newG = g8 + brighten
+	} else {
+		newG = 255
+	}
+
+	newB := b8
+	if b8 < 255-brighten {
+		newB = b8 + brighten
+	} else {
+		newB = 255
+	}
+
+	return color.RGBA{newR, newG, newB, a8}
+}

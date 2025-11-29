@@ -1,0 +1,609 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+	"github.com/creack/pty"
+	"github.com/scottpeterman/gopyte/gopyte"
+)
+
+// TerminalWidget represents our terminal emulator widget
+type TerminalWidget struct {
+	widget.BaseWidget
+
+	// Core components - use WideCharScreen for best support
+	screen   *gopyte.WideCharScreen // Most advanced screen type
+	stream   *gopyte.Stream
+	richText *widget.RichText
+	scroll   *container.Scroll
+
+	// PTY handling
+	ptyFile *os.File
+	cmd     *exec.Cmd
+
+	// State management
+	inAlternateScreen bool
+	scrollbackBuffer  []string
+	maxScrollbackSize int
+
+	// Thread safety and performance
+	mutex            sync.RWMutex
+	updateChannel    chan []byte
+	updatePending    bool
+	throttleInterval time.Duration
+
+	// Context for cancellation
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// NewTerminalWidget creates a new terminal emulator widget
+func NewTerminalWidget() *TerminalWidget {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	t := &TerminalWidget{
+		maxScrollbackSize: 1000,
+		throttleInterval:  50 * time.Millisecond, // 20 FPS for POC
+		updateChannel:     make(chan []byte, 100),
+		ctx:               ctx,
+		cancel:            cancel,
+	}
+
+	// Initialize GoPyte components using WideCharScreen
+	// (most advanced - supports wide chars, alternate screen, history)
+	t.screen = gopyte.NewWideCharScreen(80, 24, 1000) // cols, lines, maxHistory
+	t.stream = gopyte.NewStream(t.screen, false)      // screen, debug
+
+	// Create Fyne components
+	t.richText = widget.NewRichText()
+	t.richText.Wrapping = fyne.TextWrapOff
+
+	// Create scrollable container
+	t.scroll = container.NewScroll(t.richText)
+	t.scroll.SetMinSize(fyne.NewSize(800, 600))
+
+	// Start background processing
+	go t.dataProcessor()
+	go t.updateProcessor()
+
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+// CreateRenderer implements fyne.Widget interface
+func (t *TerminalWidget) CreateRenderer() fyne.WidgetRenderer {
+	return &terminalRenderer{
+		widget: t,
+		scroll: t.scroll,
+	}
+}
+
+type terminalRenderer struct {
+	widget *TerminalWidget
+	scroll *container.Scroll
+}
+
+func (r *terminalRenderer) Layout(size fyne.Size) {
+	r.scroll.Resize(size)
+}
+
+func (r *terminalRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(400, 300)
+}
+
+func (r *terminalRenderer) Refresh() {
+	r.scroll.Refresh()
+}
+
+func (r *terminalRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.scroll}
+}
+
+func (r *terminalRenderer) Destroy() {}
+
+// StartPTY starts a PTY process
+func (t *TerminalWidget) StartPTY() error {
+	// Start shell command
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+	cmd := exec.Command(shell)
+
+	// Create PTY
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to start PTY: %v", err)
+	}
+
+	t.ptyFile = ptmx
+	t.cmd = cmd
+
+	// Set initial size
+	pty.Setsize(ptmx, &pty.Winsize{
+		Rows: 24,
+		Cols: 80,
+	})
+
+	// Start reading from PTY
+	go t.fetchTerminalData()
+
+	return nil
+}
+
+// fetchTerminalData reads data from PTY and feeds it to the update channel
+func (t *TerminalWidget) fetchTerminalData() {
+	buffer := make([]byte, 1024)
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		default:
+			n, err := t.ptyFile.Read(buffer)
+			if err != nil {
+				log.Printf("PTY read error: %v", err)
+				return
+			}
+
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buffer[:n])
+
+				select {
+				case t.updateChannel <- data:
+				case <-t.ctx.Done():
+					return
+				default:
+					// Channel full, drop data to prevent blocking
+				}
+			}
+		}
+	}
+}
+
+// dataProcessor processes incoming terminal data
+func (t *TerminalWidget) dataProcessor() {
+	for {
+		select {
+		case data := <-t.updateChannel:
+			t.processTerminalData(data)
+		case <-t.ctx.Done():
+			return
+		}
+	}
+}
+
+// processTerminalData processes raw terminal data
+func (t *TerminalWidget) processTerminalData(data []byte) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	// Feed data to GoPyte stream - using correct API (string input)
+	t.stream.Feed(string(data))
+
+	// Handle escape sequences for mode changes
+	dataStr := string(data)
+	t.handleEscapeSequences(dataStr)
+
+	// Schedule UI update
+	t.updatePending = true
+}
+
+// handleEscapeSequences detects and handles terminal mode changes
+func (t *TerminalWidget) handleEscapeSequences(data string) {
+	// Note: WideCharScreen's embedded AlternateScreen should handle mode switching
+	// automatically, but we can still track it for our UI logic
+
+	// Entering alternate screen
+	if strings.Contains(data, "\x1b[?1049h") || strings.Contains(data, "\x1b[?47h") {
+		if !t.inAlternateScreen {
+			t.preserveCurrentScreen()
+			t.inAlternateScreen = true
+		}
+	}
+
+	// Leaving alternate screen
+	if strings.Contains(data, "\x1b[?1049l") || strings.Contains(data, "\x1b[?47l") {
+		t.inAlternateScreen = false
+	}
+}
+
+// preserveCurrentScreen saves current screen content to scrollback
+func (t *TerminalWidget) preserveCurrentScreen() {
+	currentContent := t.extractScreenContent()
+	for _, line := range currentContent {
+		if strings.TrimSpace(line) != "" {
+			t.addToScrollback(line)
+		}
+	}
+}
+
+// addToScrollback adds a line to the scrollback buffer with size management
+func (t *TerminalWidget) addToScrollback(line string) {
+	t.scrollbackBuffer = append(t.scrollbackBuffer, line)
+
+	if len(t.scrollbackBuffer) > t.maxScrollbackSize {
+		removeCount := len(t.scrollbackBuffer) - t.maxScrollbackSize
+		t.scrollbackBuffer = t.scrollbackBuffer[removeCount:]
+	}
+}
+
+// updateProcessor handles UI updates with throttling
+func (t *TerminalWidget) updateProcessor() {
+	ticker := time.NewTicker(t.throttleInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if t.updatePending {
+				t.performRedraw()
+				t.updatePending = false
+			}
+		case <-t.ctx.Done():
+			return
+		}
+	}
+}
+
+// performRedraw executes the actual UI update
+func (t *TerminalWidget) performRedraw() {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+
+	var combinedLines []string
+
+	if t.inAlternateScreen {
+		combinedLines = t.extractScreenContent()
+	} else {
+		// Combine scrollback with current screen
+		combinedLines = make([]string, len(t.scrollbackBuffer))
+		copy(combinedLines, t.scrollbackBuffer)
+
+		currentContent := t.extractScreenContent()
+		combinedLines = append(combinedLines, currentContent...)
+	}
+
+	// Convert to rich text segments
+	segments := t.createRichTextSegments(combinedLines)
+
+	// Update UI on main thread
+	t.richText.Segments = segments
+	t.richText.Refresh()
+
+	// Auto-scroll to bottom in normal mode
+	if !t.inAlternateScreen {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			t.scroll.ScrollToBottom()
+		}()
+	}
+}
+
+// extractScreenContent extracts text content from the WideCharScreen
+func (t *TerminalWidget) extractScreenContent() []string {
+	// WideCharScreen has GetDisplay() that properly handles wide characters
+	display := t.screen.GetDisplay()
+
+	// Convert to proper string slice (already []string with proper wide char handling)
+	var lines []string
+	for _, line := range display {
+		// Trim trailing spaces but preserve the line structure
+		trimmedLine := strings.TrimRight(line, " ")
+		lines = append(lines, trimmedLine)
+	}
+
+	return lines
+}
+
+// createRichTextSegments converts text lines to Fyne rich text segments
+func (t *TerminalWidget) createRichTextSegments(lines []string) []widget.RichTextSegment {
+	var segments []widget.RichTextSegment
+
+	// Create a single text block with all lines joined by newlines
+	// This prevents double newlines and maintains proper terminal structure
+	var allText strings.Builder
+
+	for i, line := range lines {
+		// Always add the line content (even if empty to preserve line structure)
+		allText.WriteString(line)
+
+		// Add newline except for the very last line
+		if i < len(lines)-1 {
+			allText.WriteString("\n")
+		}
+	}
+
+	// Create a single segment for all terminal content
+	if allText.Len() > 0 {
+		segments = append(segments, &widget.TextSegment{
+			Text: allText.String(),
+			Style: widget.RichTextStyle{
+				ColorName: theme.ColorNameForeground,
+				TextStyle: fyne.TextStyle{Monospace: true},
+			},
+		})
+	}
+
+	// Add cursor indicator with proper positioning for wide chars
+	cursorX, cursorY := t.screen.GetCursor()
+	_ = cursorX // Will be used for proper positioning later
+	_ = cursorY
+
+	segments = append(segments, &widget.TextSegment{
+		Text: " ▋", // Simple cursor indicator
+		Style: widget.RichTextStyle{
+			ColorName: theme.ColorNamePrimary,
+			TextStyle: fyne.TextStyle{Monospace: true},
+		},
+	})
+
+	return segments
+}
+
+// WriteToPTY sends data to the PTY
+func (t *TerminalWidget) WriteToPTY(data []byte) error {
+	if t.ptyFile != nil {
+		_, err := t.ptyFile.Write(data)
+		return err
+	}
+	return fmt.Errorf("PTY not initialized")
+}
+
+// GetSize returns the current terminal size
+func (t *TerminalWidget) GetSize() (int, int) {
+	// Default to 80x24 for POC - WideCharScreen should maintain size internally
+	return 80, 24
+}
+
+// SetSize updates the terminal screen size
+func (t *TerminalWidget) SetSize(cols, rows int) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	// Resize the WideCharScreen (handles wide char cell width arrays)
+	t.screen.Resize(cols, rows)
+
+	// Resize PTY if available
+	if t.ptyFile != nil {
+		pty.Setsize(t.ptyFile, &pty.Winsize{
+			Rows: uint16(rows),
+			Cols: uint16(cols),
+		})
+	}
+
+	// Trigger redraw
+	t.updatePending = true
+}
+
+// Clear clears the terminal screen and history
+func (t *TerminalWidget) Clear() {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	// Reset the screen (WideCharScreen's Reset handles wide char state)
+	t.screen.Reset()
+
+	// Clear our additional scrollback buffer
+	t.scrollbackBuffer = nil
+
+	// Trigger redraw
+	t.updatePending = true
+}
+
+// ScrollUp scrolls up in history (using built-in functionality)
+func (t *TerminalWidget) ScrollUp(lines int) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	t.screen.ScrollUp(lines)
+	t.updatePending = true
+}
+
+// ScrollDown scrolls down in history
+func (t *TerminalWidget) ScrollDown(lines int) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	t.screen.ScrollDown(lines)
+	t.updatePending = true
+}
+
+// ScrollToBottom returns to live view
+func (t *TerminalWidget) ScrollToBottom() {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	t.screen.ScrollToBottom()
+	t.updatePending = true
+}
+
+// IsViewingHistory returns true if scrolled back in history
+func (t *TerminalWidget) IsViewingHistory() bool {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+
+	return t.screen.IsViewingHistory()
+}
+
+// GetHistorySize returns the current history size
+func (t *TerminalWidget) GetHistorySize() int {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+
+	return t.screen.GetHistorySize()
+}
+
+// Close cleanup resources
+func (t *TerminalWidget) Close() {
+	t.cancel()
+
+	if t.ptyFile != nil {
+		t.ptyFile.Close()
+	}
+
+	if t.cmd != nil && t.cmd.Process != nil {
+		t.cmd.Process.Kill()
+	}
+}
+
+// Simple key handler for POC
+func handleKeyInput(terminal *TerminalWidget, entry *widget.Entry) {
+	entry.OnChanged = func(text string) {
+		if len(text) > 0 {
+			lastChar := text[len(text)-1:]
+			terminal.WriteToPTY([]byte(lastChar))
+			entry.SetText("") // Clear for next input
+		}
+	}
+
+	entry.OnSubmitted = func(text string) {
+		terminal.WriteToPTY([]byte("\r"))
+	}
+}
+
+func main() {
+	// Create Fyne application
+	myApp := app.New()
+	myWindow := myApp.NewWindow("GoPyte WideChar Terminal POC")
+	myWindow.Resize(fyne.NewSize(1000, 750))
+
+	// Create terminal widget
+	terminal := NewTerminalWidget()
+
+	// Start PTY
+	if err := terminal.StartPTY(); err != nil {
+		log.Fatal("Failed to start PTY:", err)
+	}
+
+	// Create input field for key capture
+	input := widget.NewEntry()
+	input.SetPlaceHolder("Focus here and type commands...")
+	handleKeyInput(terminal, input)
+
+	// Create test buttons
+	clearBtn := widget.NewButton("Clear Screen", func() {
+		terminal.WriteToPTY([]byte("clear\r"))
+	})
+
+	lsBtn := widget.NewButton("ls -la", func() {
+		terminal.WriteToPTY([]byte("ls -la\r"))
+	})
+
+	topBtn := widget.NewButton("top", func() {
+		terminal.WriteToPTY([]byte("top\r"))
+	})
+
+	vimBtn := widget.NewButton("vim test.txt", func() {
+		terminal.WriteToPTY([]byte("vim test.txt\r"))
+	})
+
+	htopBtn := widget.NewButton("htop", func() {
+		terminal.WriteToPTY([]byte("htop\r"))
+	})
+
+	catBtn := widget.NewButton("cat /etc/passwd", func() {
+		terminal.WriteToPTY([]byte("cat /etc/passwd\r"))
+	})
+
+	// Unicode test buttons
+	emojiBtn := widget.NewButton("🚀 Emoji Test", func() {
+		terminal.WriteToPTY([]byte("echo '🚀 Rocket 🌟 Star 💻 Computer 🎉 Party'\r"))
+	})
+
+	cjkBtn := widget.NewButton("CJK Test", func() {
+		terminal.WriteToPTY([]byte("echo '中文 日本語 한국어 Wide Characters'\r"))
+	})
+
+	unicodeBtn := widget.NewButton("Unicode Mix", func() {
+		terminal.WriteToPTY([]byte("echo 'ASCII 中文 🌍 العربية Русский 日本語'\r"))
+	})
+
+	// History navigation buttons
+	scrollUpBtn := widget.NewButton("↑ Scroll Up", func() {
+		terminal.ScrollUp(5)
+	})
+
+	scrollDownBtn := widget.NewButton("↓ Scroll Down", func() {
+		terminal.ScrollDown(5)
+	})
+
+	scrollBottomBtn := widget.NewButton("⇣ Live View", func() {
+		terminal.ScrollToBottom()
+	})
+
+	// Status label
+	statusLabel := widget.NewLabel("History: 0 lines | Mode: Live | WideChar Support: ON")
+
+	// Update status periodically
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				historySize := terminal.GetHistorySize()
+				viewing := terminal.IsViewingHistory()
+				mode := "Live"
+				if viewing {
+					mode = "History"
+				}
+				statusLabel.SetText(fmt.Sprintf("History: %d lines | Mode: %s | WideChar: ON", historySize, mode))
+			case <-terminal.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Create info label
+	infoLabel := widget.NewLabel("GoPyte WideCharScreen POC - Full Unicode + Emoji + CJK Support")
+
+	// Layout
+	buttonRow1 := container.NewHBox(clearBtn, lsBtn, topBtn)
+	buttonRow2 := container.NewHBox(vimBtn, htopBtn, catBtn)
+	unicodeRow := container.NewHBox(emojiBtn, cjkBtn, unicodeBtn)
+	historyRow := container.NewHBox(scrollUpBtn, scrollDownBtn, scrollBottomBtn)
+	buttons := container.NewVBox(buttonRow1, buttonRow2, unicodeRow, historyRow)
+
+	inputContainer := container.NewBorder(nil, nil, widget.NewLabel("Input:"), nil, input)
+	statusContainer := container.NewVBox(statusLabel)
+	controls := container.NewVBox(infoLabel, buttons, inputContainer, statusContainer)
+
+	content := container.NewBorder(controls, nil, nil, nil, terminal)
+	myWindow.SetContent(content)
+
+	// Cleanup on close
+	myWindow.SetCloseIntercept(func() {
+		terminal.Close()
+		myApp.Quit()
+	})
+
+	// Focus the input field
+	myWindow.Canvas().Focus(input)
+
+	// Show some initial content with Unicode support
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		terminal.WriteToPTY([]byte("echo '🚀 GoPyte WideCharScreen Terminal POC Started!'\r"))
+		time.Sleep(200 * time.Millisecond)
+		terminal.WriteToPTY([]byte("echo '✨ Unicode + Emoji + CJK Support Enabled'\r"))
+		time.Sleep(200 * time.Millisecond)
+		terminal.WriteToPTY([]byte("echo 'Try the Unicode test buttons above! 🎉'\r"))
+	}()
+
+	// Show and run
+	myWindow.ShowAndRun()
+}
