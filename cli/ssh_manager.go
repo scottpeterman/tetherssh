@@ -48,6 +48,7 @@ type SessionManager struct {
 	tabContainer  *container.DocTabs
 	mainContainer *fyne.Container
 	searchEntry   *widget.Entry
+	memMonitor    *MemoryMonitor
 	
 	// Session data
 	savedSessions    []SessionInfo
@@ -69,6 +70,7 @@ type SessionManager struct {
 	
 	// Callbacks
 	onSessionConnect func(session SessionInfo)
+
 }
 
 // SessionTab represents an active terminal tab
@@ -300,6 +302,7 @@ func (sm *SessionManager) getActiveTerminal() *SSHTerminalWidget {
 }
 
 // buildUI constructs the session manager interface
+// buildUI constructs the session manager interface
 func (sm *SessionManager) buildUI() {
 	// Build session tree (left sidebar)
 	sm.sessionTree = sm.buildSessionTree()
@@ -323,7 +326,19 @@ func (sm *SessionManager) buildUI() {
 	split := container.NewHSplit(sidebar, sm.tabContainer)
 	split.SetOffset(0.2)
 	
-	sm.mainContainer = container.NewMax(split)
+	// Create memory monitor and status bar
+	sm.memMonitor = NewMemoryMonitor()
+	sm.memMonitor.Start(5 * time.Second)
+	statusBar := CreateStatusBar(sm.memMonitor)
+	
+	// Main container with status bar at bottom
+	sm.mainContainer = container.NewBorder(
+		nil,       // top
+		statusBar, // bottom
+		nil,       // left
+		nil,       // right
+		split,     // center
+	)
 }
 
 // buildSearchBox creates the search/filter entry
@@ -806,25 +821,28 @@ func (sm *SessionManager) doConnect(session SessionInfo, password string) {
 		State:    StateDisconnected,
 	}
 	
-	terminal.SetStateChangeHandler(func(state ConnectionState) {
-		sessionTab.State = state
-		sm.sessionTree.Refresh() // Update status indicators in tree
-		
-		switch state {
-		case StateConnecting:
-			tabItem.Text = fmt.Sprintf("%s (connecting...)", tabName)
-		case StateAuthenticating:
-			tabItem.Text = fmt.Sprintf("%s (authenticating...)", tabName)
-		case StateConnected:
-			tabItem.Text = tabName
-			sm.window.Canvas().Focus(terminal)
-		case StateError:
-			tabItem.Text = fmt.Sprintf("%s (error)", tabName)
-		case StateDisconnected:
-			tabItem.Text = fmt.Sprintf("%s (disconnected)", tabName)
-		}
-		sm.tabContainer.Refresh()
-	})
+terminal.SetStateChangeHandler(func(state ConnectionState) {
+    sessionTab.State = state
+    
+    fyne.Do(func() {
+        sm.sessionTree.Refresh()
+        
+        switch state {
+        case StateConnecting:
+            tabItem.Text = fmt.Sprintf("%s (connecting...)", tabName)
+        case StateAuthenticating:
+            tabItem.Text = fmt.Sprintf("%s (authenticating...)", tabName)
+        case StateConnected:
+            tabItem.Text = tabName
+            sm.window.Canvas().Focus(terminal)
+        case StateError:
+            tabItem.Text = fmt.Sprintf("%s (error)", tabName)
+        case StateDisconnected:
+            tabItem.Text = fmt.Sprintf("%s (disconnected)", tabName)
+        }
+        sm.tabContainer.Refresh()
+    })
+})
 	
 	terminal.SetErrorHandler(func(err error) {
 		log.Printf("SSH error for %s [%s]: %v", session.Name, tabID, err)
@@ -1054,6 +1072,11 @@ func (sm *SessionManager) showAddSessionDialog() {
 
 // DisconnectAll closes all active sessions
 func (sm *SessionManager) DisconnectAll() {
+	// Stop status bar updates
+	// if sm.statusBar != nil {
+	// 	sm.statusBar.Stop()
+	// }
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 

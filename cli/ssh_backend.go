@@ -167,8 +167,9 @@ type SSHBackend struct {
 	authMethod AuthMethod
 
 	// Callbacks
-	authPromptHandler  AuthPromptCallback
-	stateChangeHandler StateChangeCallback
+	authPromptHandler    AuthPromptCallback
+	stateChangeHandler   StateChangeCallback
+	connectionLostHandler func(error) // NEW: Called when connection dies unexpectedly
 
 	// Context for cancellation
 	ctx    context.Context
@@ -177,6 +178,11 @@ type SSHBackend struct {
 	// Connection management
 	connMutex     sync.Mutex
 	keepAliveDone chan struct{}
+}
+	
+// SetConnectionLostHandler sets callback for unexpected disconnections
+func (s *SSHBackend) SetConnectionLostHandler(handler func(error)) {
+	s.connectionLostHandler = handler
 }
 
 // NewSSHBackend creates a new SSH backend with the given configuration
@@ -251,6 +257,7 @@ func (s *SSHBackend) GetAuthMethod() AuthMethod {
 }
 
 // Connect establishes the SSH connection
+// Connect establishes the SSH connection
 func (s *SSHBackend) Connect() error {
 	s.connMutex.Lock()
 	defer s.connMutex.Unlock()
@@ -278,6 +285,13 @@ func (s *SSHBackend) Connect() error {
 		s.lastError = fmt.Errorf("failed to connect to %s: %w", addr, err)
 		s.setState(StateError)
 		return s.lastError
+	}
+
+	// Enable TCP-level keepalive (survives sleep better than app-level)
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		log.Printf("SSH: TCP keepalive enabled (30s interval)")
 	}
 
 	// Set connection deadline for SSH handshake
@@ -729,28 +743,56 @@ func (s *SSHBackend) startKeepAlive() {
 			select {
 			case <-ticker.C:
 				if s.client == nil {
+					log.Printf("SSH: Keepalive stopping - client is nil")
 					return
 				}
 
-				// Send keepalive request
-				_, _, err := s.client.SendRequest("keepalive@openssh.com", true, nil)
-				if err != nil {
+				// Send keepalive with timeout
+				keepaliveResult := make(chan error, 1)
+				go func() {
+					_, _, err := s.client.SendRequest("keepalive@openssh.com", true, nil)
+					keepaliveResult <- err
+				}()
+
+				select {
+				case err := <-keepaliveResult:
+					if err != nil {
+						missedCount++
+						log.Printf("SSH: Keepalive failed (%d/%d): %v",
+							missedCount, s.config.KeepAliveMaxCount, err)
+
+						if missedCount >= s.config.KeepAliveMaxCount {
+							log.Printf("SSH: Too many missed keepalives, connection lost")
+							s.lastError = fmt.Errorf("connection lost: keepalive timeout")
+							s.Close()
+							return
+						}
+					} else {
+						if missedCount > 0 {
+							log.Printf("SSH: Keepalive recovered after %d missed", missedCount)
+						}
+						missedCount = 0
+					}
+
+				case <-time.After(10 * time.Second):
+					// Keepalive request itself timed out - connection is dead
 					missedCount++
-					log.Printf("SSH: Keepalive failed (%d/%d): %v",
-						missedCount, s.config.KeepAliveMaxCount, err)
+					log.Printf("SSH: Keepalive timed out (%d/%d)", 
+						missedCount, s.config.KeepAliveMaxCount)
 
 					if missedCount >= s.config.KeepAliveMaxCount {
-						log.Printf("SSH: Too many missed keepalives, disconnecting")
+						log.Printf("SSH: Connection dead (keepalive timeout)")
+						s.lastError = fmt.Errorf("connection lost: keepalive timeout")
 						s.Close()
 						return
 					}
-				} else {
-					missedCount = 0
 				}
 
 			case <-s.keepAliveDone:
+				log.Printf("SSH: Keepalive stopped (normal shutdown)")
 				return
 			case <-s.ctx.Done():
+				log.Printf("SSH: Keepalive stopped (context cancelled)")
 				return
 			}
 		}
@@ -944,6 +986,25 @@ func (w *SSHTerminalWidget) ConnectSSH() error {
 		}
 	})
 
+	// Set up connection lost handler (for keepalive failures, sleep/wake, etc.)
+	w.sshBackend.SetConnectionLostHandler(func(err error) {
+		log.Printf("SSH connection lost unexpectedly: %v", err)
+		
+		// Update UI state
+		if w.onStateChange != nil {
+			fyne.Do(func() {
+				w.onStateChange(StateDisconnected)
+			})
+		}
+		
+		// Notify user
+		if w.onError != nil {
+			fyne.Do(func() {
+				w.onError(err)
+			})
+		}
+	})
+
 	// Connect
 	if err := w.sshBackend.Connect(); err != nil {
 		if w.onError != nil {
@@ -992,6 +1053,7 @@ func (w *SSHTerminalWidget) triggerPostConnectResize() {
 	})
 }
 
+
 // sshReadLoop - Reads from SSH and feeds to gopyte for terminal emulation
 func (w *SSHTerminalWidget) sshReadLoop() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1009,16 +1071,51 @@ func (w *SSHTerminalWidget) sshReadLoop() {
 			log.Printf("sshReadLoop: backend context done")
 			return
 		default:
+			// Set a read deadline to prevent blocking forever on dead connections
+			// This allows us to check context cancellation periodically
 			n, err := w.sshBackend.Read(buf)
 			if err != nil {
-				if err == io.EOF {
-					log.Printf("sshReadLoop: EOF from server")
-				} else if !strings.Contains(err.Error(), "closed") && !errors.Is(err, context.Canceled) {
-					log.Printf("SSH read error: %v", err)
-					if w.onError != nil {
-						fyne.Do(func() { w.onError(err) })
+				// Determine the type of error
+				isEOF := err == io.EOF
+				isClosed := strings.Contains(err.Error(), "closed") || 
+				            strings.Contains(err.Error(), "EOF")
+				isCancelled := errors.Is(err, context.Canceled)
+				isTimeout := strings.Contains(err.Error(), "timeout") ||
+				             strings.Contains(err.Error(), "deadline")
+				isReset := strings.Contains(err.Error(), "reset") ||
+				           strings.Contains(err.Error(), "broken pipe") ||
+				           strings.Contains(err.Error(), "connection refused")
+
+				if isEOF || isClosed {
+					log.Printf("sshReadLoop: Connection closed normally")
+				} else if isCancelled {
+					log.Printf("sshReadLoop: Read cancelled")
+				} else if isTimeout {
+					// Timeout might just mean no data, continue if still connected
+					if w.sshBackend != nil && w.sshBackend.IsConnected() {
+						continue
 					}
+					log.Printf("sshReadLoop: Read timeout and disconnected")
+				} else if isReset {
+					log.Printf("sshReadLoop: Connection reset by peer: %v", err)
+				} else {
+					log.Printf("sshReadLoop: Unexpected read error: %v", err)
 				}
+
+				// Update UI state to disconnected
+				if w.onStateChange != nil {
+					fyne.Do(func() { 
+						w.onStateChange(StateDisconnected) 
+					})
+				}
+				
+				// Show error to user if it wasn't a clean shutdown
+				if !isEOF && !isClosed && !isCancelled && w.onError != nil {
+					fyne.Do(func() { 
+						w.onError(fmt.Errorf("connection lost: %v", err)) 
+					})
+				}
+				
 				return
 			}
 

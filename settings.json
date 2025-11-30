@@ -1,0 +1,29 @@
+{
+  "row_offset": 1,
+  "col_offset": 6,
+  "font_size": 12,
+  "dark_theme": true,
+  "dark_theme_colors": {
+    "primary": "4d99b3",
+    "secondary": "cccccc",
+    "foreground": "cccccc"
+  },
+  "light_theme_colors": {
+    "primary": "963c5b",
+    "secondary": "963c5b",
+    "selection": "e3d1d7"
+  },
+  "default_key_path": "/home/speterman/.ssh/id_rsa",
+  "default_port": 22,
+  "default_username": "",
+  "connection_timeout": 30,
+  "keepalive_interval": 60,
+  "enable_logging": false,
+  "log_directory": "./logs",
+  "timestamp_logs": true,
+  "scrollback_lines": 1000,
+  "copy_on_select": false,
+  "remember_window_size": true,
+  "window_width": 1145,
+  "window_height": 675
+}

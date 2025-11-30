@@ -17,12 +17,15 @@ func main() {
 	// Initialize settings first
 	settings := GetSettings()
 
-	myApp := app.New()
+	myApp := app.NewWithID("com.github.scottpeterman.tetherssh")
+	myApp.SetIcon(resourceLogoPng)
+
 
 	// Apply theme from settings
 	myApp.Settings().SetTheme(NewNativeTheme(settings.Get().DarkTheme))
 
 	myWindow := myApp.NewWindow(fmt.Sprintf("TetherSSH - %s", runtime.GOOS))
+	myWindow.SetIcon(resourceLogoPng)
 
 	// Apply saved window size from settings
 	s := settings.Get()
