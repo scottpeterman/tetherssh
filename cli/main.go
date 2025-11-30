@@ -6,28 +6,53 @@ import (
 	"runtime"
 	"time"
 
-	  "fyne.io/fyne/v2"
-  "fyne.io/fyne/v2/app"
-  "fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/dialog"
 )
 
 func main() {
 	log.Printf("Starting TetherSSH on %s", runtime.GOOS)
 
+	// Initialize settings first
+	settings := GetSettings()
+
 	myApp := app.New()
-	darkMode := true
-	myApp.Settings().SetTheme(NewNativeTheme(darkMode))
+
+	// Apply theme from settings
+	myApp.Settings().SetTheme(NewNativeTheme(settings.Get().DarkTheme))
 
 	myWindow := myApp.NewWindow(fmt.Sprintf("TetherSSH - %s", runtime.GOOS))
-	myWindow.Resize(fyne.NewSize(1200, 800))
+
+	// Apply saved window size from settings
+	s := settings.Get()
+	if s.RememberWindowSize && s.WindowWidth > 0 && s.WindowHeight > 0 {
+		myWindow.Resize(fyne.NewSize(float32(s.WindowWidth), float32(s.WindowHeight)))
+	} else {
+		myWindow.Resize(fyne.NewSize(1200, 800))
+	}
 
 	// Create session manager
 	sessionManager := NewSessionManager(myWindow)
 	myWindow.SetContent(sessionManager.GetContainer())
 
-	// SINGLE, CORRECT close interceptor with confirm dialog
+	// Set up settings save callback for live theme updates
+	settings.SetOnSave(func(newSettings *AppSettings) {
+		myApp.Settings().SetTheme(NewNativeTheme(newSettings.DarkTheme))
+		log.Printf("Settings updated - theme applied")
+	})
+
+	// Close interceptor with window size saving
 	myWindow.SetCloseIntercept(func() {
 		sm := sessionManager
+
+		// Save window size if enabled
+		if settings.Get().RememberWindowSize {
+			size := myWindow.Canvas().Size()
+			settings.Get().WindowWidth = int(size.Width)
+			settings.Get().WindowHeight = int(size.Height)
+			settings.Save()
+		}
 
 		sm.tabsMutex.RLock()
 		activeCount := len(sm.activeTabs)

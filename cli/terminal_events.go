@@ -462,7 +462,7 @@ func (t *NativeTerminalWidget) performResize(width, height float32) {
 	needsResize := newCols != currentCols || newRows != currentRows
 
 	if needsResize {
-		log.Printf("performResize: from %dx%d to %dx%d (widget: %.1fx%.1f)", 
+		log.Printf("performResize: from %dx%d to %dx%d (widget: %.1fx%.1f)",
 			currentCols, currentRows, newCols, newRows, width, height)
 
 		// Update terminal dimensions
@@ -530,7 +530,6 @@ func (t *NativeTerminalWidget) performPTYResize(newRows, newCols int) {
 
 // SIZING AND UTILITY METHODS
 
-// *** FIX: Improved dimension calculation ***
 func (t *NativeTerminalWidget) CalculateTerminalSize(width, height float32) (int, int) {
 	// Ensure we have valid character dimensions
 	if t.charWidth <= 0 || t.charHeight <= 0 {
@@ -541,8 +540,8 @@ func (t *NativeTerminalWidget) CalculateTerminalSize(width, height float32) (int
 
 	// Account for padding/margins in the terminal widget
 	// Fyne TextGrid typically has some internal padding
-	const horizontalPadding float32 = 4.0  // Left + right padding
-	const verticalPadding float32 = 2.0    // Top + bottom padding (minimal)
+	const horizontalPadding float32 = 4.0 // Left + right padding
+	const verticalPadding float32 = 2.0   // Top + bottom padding (minimal)
 
 	usableWidth := width - horizontalPadding
 	usableHeight := height - verticalPadding
@@ -552,7 +551,7 @@ func (t *NativeTerminalWidget) CalculateTerminalSize(width, height float32) (int
 		usableWidth = width
 	}
 	if usableHeight < 2 {
-		usableHeight = height -2
+		usableHeight = height - 2
 	}
 	// Calculate columns and rows
 	cols := int(usableWidth / t.charWidth)
@@ -626,7 +625,7 @@ func (t *NativeTerminalWidget) isPTYAvailable() bool {
 		fmt.Printf("isPTYAvailable: writeOverride is set, returning true\n")
 		return true
 	}
-	
+
 	hasPTY := t.ptyManager != nil && t.ptyManager.pty != nil
 	fmt.Printf("isPTYAvailable: ptyManager check = %v\n", hasPTY)
 	return hasPTY

@@ -477,23 +477,31 @@ func (sm *SessionManager) buildSessionTree() *widget.Tree {
 func (sm *SessionManager) buildSidebarHeader() fyne.CanvasObject {
 	title := widget.NewLabel("Sessions")
 	title.TextStyle = fyne.TextStyle{Bold: true}
-	
+
 	quickBtn := widget.NewButtonWithIcon("", theme.MediaFastForwardIcon(), func() {
 		sm.showQuickConnectDialog()
 	})
 	quickBtn.Importance = widget.LowImportance
-	
-	editBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() {
+
+	// Changed to DocumentCreateIcon to free up SettingsIcon
+	editBtn := widget.NewButtonWithIcon("", theme.DocumentCreateIcon(), func() {
 		sm.showSessionEditor()
 	})
 	editBtn.Importance = widget.LowImportance
-	
+
 	addBtn := widget.NewButtonWithIcon("", theme.ContentAddIcon(), func() {
 		sm.showAddSessionDialog()
 	})
-	
-	buttons := container.NewHBox(quickBtn, editBtn, addBtn)
-	
+	addBtn.Importance = widget.LowImportance
+
+	// NEW: Settings button
+	settingsBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() {
+		GetSettings().ShowSettingsDialog(sm.window)
+	})
+	settingsBtn.Importance = widget.LowImportance
+
+	buttons := container.NewHBox(quickBtn, editBtn, addBtn, settingsBtn)
+
 	return container.NewBorder(nil, nil, title, buttons)
 }
 
@@ -514,8 +522,13 @@ func (sm *SessionManager) GetContainer() *fyne.Container {
 	return sm.mainContainer
 }
 
-// getDefaultKeyPath returns the default SSH key path
+// getDefaultKeyPath returns the default SSH key path from settings
 func getDefaultKeyPath() string {
+	settings := GetSettings().Get()
+	if settings.DefaultKeyPath != "" {
+		return settings.DefaultKeyPath
+	}
+
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "~/.ssh/id_rsa"
