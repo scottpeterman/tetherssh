@@ -178,27 +178,47 @@ Log filename format: `{session_name}_{YYYYMMDD_HHMMSS}.log`
 ```
 tetherssh/
 ├── cli/
-│   └── main.go              # Application entry, window setup
-├── session_manager.go       # Tree navigator, search, tab management
-├── session_persistence.go   # YAML load/save, SessionStore
-├── session_editor.go        # CRUD modal dialog
-├── settings.go              # Application settings dialog
-├── ssh_backend.go           # SSH client, auth chain, SSHTerminalWidget
-├── terminal_widget.go       # NativeTerminalWidget - core terminal UI
-├── terminal_pty.go          # Local PTY support, WriteToPTY, history
-├── terminal_events.go       # Keyboard/mouse event handling, resize
-├── terminal_display.go      # TextGrid rendering, viewport calculation
-├── terminal_selection.go    # Text selection and clipboard
-├── theme.go                 # Fyne theme, color mappings
-├── scroll_container.go      # Custom scroll container
-├── screenshots/             # Application screenshots
-└── internal/gopyte/         # Terminal emulation library
-    ├── screen.go            # Base screen buffer (NativeScreen)
-    ├── history_screen.go    # Scrollback history management
-    ├── wide_char_screen.go  # Wide character & alternate screen support
-    └── streams.go           # ANSI escape sequence parser
+│   ├── main.go                  # Application entry, window setup
+│   ├── session_manager.go       # Tree navigator, search, tab management
+│   ├── session_persistence.go   # YAML load/save, SessionStore
+│   ├── session_editor.go        # CRUD modal dialog
+│   ├── settings.go              # Application settings dialog
+│   ├── ssh_backend.go           # SSH client, auth chain, SSHTerminalWidget
+│   ├── terminal_widget.go       # NativeTerminalWidget - core terminal UI
+│   ├── terminal_pty.go          # Local PTY support, WriteToPTY, history
+│   ├── terminal_events.go       # Keyboard/mouse event handling
+│   ├── terminal_events_bus.go   # Event bus for terminal events
+│   ├── terminal_display.go      # TextGrid rendering, viewport calculation
+│   ├── terminal_selection.go    # Text selection and clipboard
+│   ├── terminal_containers.go   # Custom container widgets
+│   ├── theme.go                 # Fyne theme, color mappings
+│   ├── pty_unix.go              # Unix PTY implementation
+│   └── pty_windows.go           # Windows PTY implementation
+├── internal/
+│   └── gopyte/                  # Terminal emulation library
+│       ├── screen.go            # Base screen buffer (NativeScreen)
+│       ├── screen_interface.go  # Screen interface definitions
+│       ├── history_screen.go    # Scrollback history management
+│       ├── wide_char_screen.go  # Wide character support
+│       ├── alternative_screen.go # Alternate screen buffer (vim, htop)
+│       ├── streams.go           # ANSI escape sequence parser
+│       ├── escape.go            # Escape sequence definitions
+│       ├── control.go           # Control character handling
+│       ├── graphics.go          # SGR/graphics attributes
+│       ├── modes.go             # Terminal mode handling
+│       ├── charset.go           # Character set support
+│       └── gopyte_test/         # Test suite
+├── screenshots/
+│   ├── htop.png
+│   ├── session_detail.png
+│   └── session_manager.png
+├── sessions/
+│   └── sessions.yaml            # Session configuration
+├── go.mod
+├── go.sum
+├── LICENSE
+└── README.md
 ```
-
 ---
 
 ## Building
