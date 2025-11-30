@@ -443,7 +443,7 @@ func (t *NativeTerminalWidget) applyColors(lines []string, attrs [][]gopyte.Attr
 
 			style := row.Cells[charIdx].Style.(*widget.CustomTextGridStyle)
 
-			// Map colors
+			// Map colors using theme-aware mappings
 			if fgColor := t.mapColor(attr.Fg); fgColor != nil {
 				style.FGColor = fgColor
 			}
@@ -458,17 +458,20 @@ func (t *NativeTerminalWidget) applyColors(lines []string, attrs [][]gopyte.Attr
 	t.textGrid.Refresh()
 }
 
-// Map gopyte color to Fyne color
+// Map gopyte color to Fyne color - now theme-aware
 func (t *NativeTerminalWidget) mapColor(colorName string) color.Color {
 	if colorName == "" || colorName == "default" {
 		return nil
 	}
 
-	if fyneColor, exists := colorMappings[colorName]; exists {
+	// Get theme-aware color mappings
+	mappings := GetTerminalColorMappings()
+
+	if fyneColor, exists := mappings[colorName]; exists {
 		return fyneColor
 	}
 
-	return colorMappings["white"]
+	return mappings["white"]
 }
 
 // New debug method to force expansion of viewport
