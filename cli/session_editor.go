@@ -22,9 +22,9 @@ type SessionEditor struct {
 	onSave       func() // Callback when sessions are modified
 
 	// UI components
-	folderList   *widget.List
-	sessionList  *widget.List
-	
+	folderList  *widget.List
+	sessionList *widget.List
+
 	// Current selection state
 	selectedFolder  string
 	selectedSession *SessionInfo
@@ -47,7 +47,7 @@ func NewSessionEditor(window fyne.Window, store *SessionStore, onSave func()) *S
 func (e *SessionEditor) refreshData() {
 	e.folders = e.sessionStore.GetFolders()
 	sort.Strings(e.folders)
-	
+
 	// If we have a selected folder, load its sessions
 	if e.selectedFolder != "" {
 		byFolder := e.sessionStore.GetSessionsByFolder()
@@ -60,10 +60,10 @@ func (e *SessionEditor) refreshData() {
 // Show displays the session editor modal
 func (e *SessionEditor) Show() {
 	e.refreshData()
-	
+
 	// Build the editor UI
 	content := e.buildUI()
-	
+
 	// Create a custom dialog with the editor content
 	d := dialog.NewCustom("Session Manager", "Close", content, e.window)
 	d.Resize(fyne.NewSize(800, 500))
@@ -81,7 +81,7 @@ func (e *SessionEditor) buildUI() fyne.CanvasObject {
 			widget.NewButtonWithIcon("", theme.DeleteIcon(), e.deleteSelectedFolder),
 		),
 	)
-	
+
 	e.folderList = widget.NewList(
 		func() int { return len(e.folders) },
 		func() fyne.CanvasObject {
@@ -96,7 +96,7 @@ func (e *SessionEditor) buildUI() fyne.CanvasObject {
 			label.SetText(e.folders[id])
 		},
 	)
-	
+
 	e.folderList.OnSelected = func(id widget.ListItemID) {
 		e.selectedFolder = e.folders[id]
 		e.selectedSession = nil
@@ -106,10 +106,10 @@ func (e *SessionEditor) buildUI() fyne.CanvasObject {
 			e.sessionList.Refresh()
 		}
 	}
-	
+
 	folderPanel := container.NewBorder(folderHeader, nil, nil, nil,
 		container.NewVScroll(e.folderList))
-	
+
 	// Right panel: Sessions
 	sessionHeader := container.NewBorder(
 		nil, nil,
@@ -120,7 +120,7 @@ func (e *SessionEditor) buildUI() fyne.CanvasObject {
 			widget.NewButtonWithIcon("", theme.DeleteIcon(), e.deleteSelectedSession),
 		),
 	)
-	
+
 	e.sessionList = widget.NewList(
 		func() int { return len(e.sessions) },
 		func() fyne.CanvasObject {
@@ -128,7 +128,7 @@ func (e *SessionEditor) buildUI() fyne.CanvasObject {
 			nameLabel.TextStyle = fyne.TextStyle{Bold: true}
 			hostLabel := widget.NewLabel("host:port")
 			typeLabel := widget.NewLabel("")
-			
+
 			return container.NewHBox(
 				widget.NewIcon(theme.ComputerIcon()),
 				container.NewVBox(nameLabel, hostLabel),
@@ -145,10 +145,10 @@ func (e *SessionEditor) buildUI() fyne.CanvasObject {
 			nameLabel := vbox.Objects[0].(*widget.Label)
 			hostLabel := vbox.Objects[1].(*widget.Label)
 			typeLabel := box.Objects[2].(*widget.Label)
-			
+
 			nameLabel.SetText(session.Name)
 			hostLabel.SetText(fmt.Sprintf("%s:%d", session.Host, session.Port))
-			
+
 			// Show device type if available
 			if session.DeviceType != "" {
 				typeLabel.SetText(session.DeviceType)
@@ -159,31 +159,31 @@ func (e *SessionEditor) buildUI() fyne.CanvasObject {
 			}
 		},
 	)
-	
+
 	e.sessionList.OnSelected = func(id widget.ListItemID) {
 		if id < len(e.sessions) {
 			e.selectedSession = &e.sessions[id]
 		}
 	}
-	
+
 	// Double-click to edit
-	// Note: Fyne doesn't have native double-click on lists, 
+	// Note: Fyne doesn't have native double-click on lists,
 	// so we use the edit button instead
-	
+
 	sessionPanel := container.NewBorder(sessionHeader, nil, nil, nil,
 		container.NewVScroll(e.sessionList))
-	
+
 	// Split view
 	split := container.NewHSplit(folderPanel, sessionPanel)
 	split.SetOffset(0.3) // 30% for folders
-	
+
 	// Bottom toolbar
 	toolbar := container.NewHBox(
 		widget.NewButtonWithIcon("Import YAML", theme.FolderOpenIcon(), e.showImportDialog),
 		widget.NewButtonWithIcon("Export YAML", theme.DocumentSaveIcon(), e.exportSessions),
 		widget.NewLabel(fmt.Sprintf("Path: %s", e.sessionStore.filePath)),
 	)
-	
+
 	return container.NewBorder(nil, toolbar, nil, nil, split)
 }
 
@@ -191,11 +191,11 @@ func (e *SessionEditor) buildUI() fyne.CanvasObject {
 func (e *SessionEditor) showAddFolderDialog() {
 	nameEntry := widget.NewEntry()
 	nameEntry.SetPlaceHolder("Folder name")
-	
+
 	items := []*widget.FormItem{
 		widget.NewFormItem("Name", nameEntry),
 	}
-	
+
 	d := dialog.NewForm("Add Folder", "Add", "Cancel", items,
 		func(confirmed bool) {
 			if confirmed && nameEntry.Text != "" {
@@ -213,16 +213,16 @@ func (e *SessionEditor) deleteSelectedFolder() {
 		dialog.ShowInformation("No Selection", "Please select a folder to delete.", e.window)
 		return
 	}
-	
+
 	// Check if folder has sessions
 	byFolder := e.sessionStore.GetSessionsByFolder()
 	sessions := byFolder[e.selectedFolder]
-	
+
 	message := fmt.Sprintf("Delete folder '%s'?", e.selectedFolder)
 	if len(sessions) > 0 {
 		message = fmt.Sprintf("Delete folder '%s' and its %d sessions?", e.selectedFolder, len(sessions))
 	}
-	
+
 	dialog.ShowConfirm("Delete Folder", message,
 		func(confirmed bool) {
 			if confirmed {
@@ -239,7 +239,7 @@ func (e *SessionEditor) showAddSessionDialog() {
 		dialog.ShowInformation("No Folder", "Please select a folder first.", e.window)
 		return
 	}
-	
+
 	e.showSessionFormDialog("Add Session", SessionInfo{}, func(session SessionInfo) {
 		e.sessionStore.AddSession(e.selectedFolder, session)
 		e.saveAndRefresh()
@@ -252,7 +252,7 @@ func (e *SessionEditor) showEditSessionDialog() {
 		dialog.ShowInformation("No Selection", "Please select a session to edit.", e.window)
 		return
 	}
-	
+
 	e.showSessionFormDialog("Edit Session", *e.selectedSession, func(session SessionInfo) {
 		// Remove old and add updated
 		e.sessionStore.RemoveSession(e.selectedSession.ID)
@@ -267,22 +267,22 @@ func (e *SessionEditor) showSessionFormDialog(title string, session SessionInfo,
 	nameEntry := widget.NewEntry()
 	nameEntry.SetText(session.Name)
 	nameEntry.SetPlaceHolder("Display name")
-	
+
 	hostEntry := widget.NewEntry()
 	hostEntry.SetText(session.Host)
 	hostEntry.SetPlaceHolder("192.168.1.1 or hostname")
-	
+
 	portEntry := widget.NewEntry()
 	if session.Port > 0 {
 		portEntry.SetText(strconv.Itoa(session.Port))
 	} else {
 		portEntry.SetText("22")
 	}
-	
+
 	usernameEntry := widget.NewEntry()
 	usernameEntry.SetText(session.Username)
 	usernameEntry.SetPlaceHolder("Leave blank to prompt")
-	
+
 	// Auth type
 	authSelect := widget.NewSelect([]string{"Password", "SSH Key", "Keyboard Interactive"}, nil)
 	switch session.AuthType {
@@ -293,44 +293,53 @@ func (e *SessionEditor) showSessionFormDialog(title string, session SessionInfo,
 	default:
 		authSelect.SetSelected("Password")
 	}
-	
+
 	keyPathEntry := widget.NewEntry()
 	keyPathEntry.SetText(session.KeyPath)
 	if session.KeyPath == "" {
 		keyPathEntry.SetText(getDefaultKeyPath())
 	}
 	keyPathEntry.Disable()
-	
+
+	// Key passphrase entry (NEW - was missing!)
+	keyPassphraseEntry := widget.NewPasswordEntry()
+	keyPassphraseEntry.SetText(session.KeyPassphrase)
+	keyPassphraseEntry.SetPlaceHolder("Passphrase (if key is encrypted)")
+	keyPassphraseEntry.Disable()
+
 	// Device info fields
 	deviceTypeEntry := widget.NewEntry()
 	deviceTypeEntry.SetText(session.DeviceType)
 	deviceTypeEntry.SetPlaceHolder("linux, cisco_ios, arista_eos, etc.")
-	
+
 	vendorEntry := widget.NewEntry()
 	vendorEntry.SetText(session.Vendor)
 	vendorEntry.SetPlaceHolder("Cisco, Arista, etc.")
-	
+
 	modelEntry := widget.NewEntry()
 	modelEntry.SetText(session.Model)
 	modelEntry.SetPlaceHolder("Model name")
-	
+
 	credsIDEntry := widget.NewEntry()
 	credsIDEntry.SetText(session.CredsID)
 	credsIDEntry.SetPlaceHolder("Credentials reference")
-	
+
 	// Toggle key path based on auth type
 	authSelect.OnChanged = func(s string) {
 		if s == "SSH Key" {
 			keyPathEntry.Enable()
+			keyPassphraseEntry.Enable()
 		} else {
 			keyPathEntry.Disable()
+			keyPassphraseEntry.Disable()
 		}
 	}
 	// Apply initial state
 	if authSelect.Selected == "SSH Key" {
 		keyPathEntry.Enable()
+		keyPassphraseEntry.Enable()
 	}
-	
+
 	items := []*widget.FormItem{
 		widget.NewFormItem("Display Name", nameEntry),
 		widget.NewFormItem("Host", hostEntry),
@@ -338,25 +347,26 @@ func (e *SessionEditor) showSessionFormDialog(title string, session SessionInfo,
 		widget.NewFormItem("Username", usernameEntry),
 		widget.NewFormItem("Auth Type", authSelect),
 		widget.NewFormItem("Key Path", keyPathEntry),
+		widget.NewFormItem("Key Passphrase", keyPassphraseEntry),
 		widget.NewFormItem("", widget.NewSeparator()),
 		widget.NewFormItem("Device Type", deviceTypeEntry),
 		widget.NewFormItem("Vendor", vendorEntry),
 		widget.NewFormItem("Model", modelEntry),
 		widget.NewFormItem("Creds ID", credsIDEntry),
 	}
-	
+
 	d := dialog.NewForm(title, "Save", "Cancel", items,
 		func(confirmed bool) {
 			if !confirmed {
 				return
 			}
-			
+
 			// Validate
 			if hostEntry.Text == "" {
 				dialog.ShowError(fmt.Errorf("host is required"), e.window)
 				return
 			}
-			
+
 			// Parse port
 			port := 22
 			if portEntry.Text != "" {
@@ -364,7 +374,7 @@ func (e *SessionEditor) showSessionFormDialog(title string, session SessionInfo,
 					port = p
 				}
 			}
-			
+
 			// Parse auth type
 			var authType AuthMethod
 			switch authSelect.Selected {
@@ -375,22 +385,23 @@ func (e *SessionEditor) showSessionFormDialog(title string, session SessionInfo,
 			default:
 				authType = AuthPassword
 			}
-			
+
 			// Build session
 			newSession := SessionInfo{
-				Name:       nameEntry.Text,
-				Host:       hostEntry.Text,
-				Port:       port,
-				Username:   usernameEntry.Text,
-				AuthType:   authType,
-				KeyPath:    keyPathEntry.Text,
-				DeviceType: deviceTypeEntry.Text,
-				Vendor:     vendorEntry.Text,
-				Model:      modelEntry.Text,
-				CredsID:    credsIDEntry.Text,
-				Group:      e.selectedFolder,
+				Name:          nameEntry.Text,
+				Host:          hostEntry.Text,
+				Port:          port,
+				Username:      usernameEntry.Text,
+				AuthType:      authType,
+				KeyPath:       keyPathEntry.Text,
+				KeyPassphrase: keyPassphraseEntry.Text,
+				DeviceType:    deviceTypeEntry.Text,
+				Vendor:        vendorEntry.Text,
+				Model:         modelEntry.Text,
+				CredsID:       credsIDEntry.Text,
+				Group:         e.selectedFolder,
 			}
-			
+
 			// Default display name to user@host if not provided
 			if newSession.Name == "" {
 				if newSession.Username != "" {
@@ -399,11 +410,14 @@ func (e *SessionEditor) showSessionFormDialog(title string, session SessionInfo,
 					newSession.Name = newSession.Host
 				}
 			}
-			
+
+			log.Printf("Saving session: Name=%s, AuthType=%v, KeyPath=%s",
+				newSession.Name, newSession.AuthType, newSession.KeyPath)
+
 			onSave(newSession)
 		}, e.window)
-	
-	d.Resize(fyne.NewSize(450, 500))
+
+	d.Resize(fyne.NewSize(450, 550))
 	d.Show()
 }
 
@@ -413,9 +427,9 @@ func (e *SessionEditor) deleteSelectedSession() {
 		dialog.ShowInformation("No Selection", "Please select a session to delete.", e.window)
 		return
 	}
-	
+
 	dialog.ShowConfirm("Delete Session",
-		fmt.Sprintf("Delete session '%s'?\n\nHost: %s:%d", 
+		fmt.Sprintf("Delete session '%s'?\n\nHost: %s:%d",
 			e.selectedSession.Name, e.selectedSession.Host, e.selectedSession.Port),
 		func(confirmed bool) {
 			if confirmed {
@@ -432,24 +446,24 @@ func (e *SessionEditor) showImportDialog() {
 	// Full file picker requires more Fyne setup
 	pathEntry := widget.NewEntry()
 	pathEntry.SetPlaceHolder("/path/to/sessions.yaml")
-	
+
 	items := []*widget.FormItem{
 		widget.NewFormItem("YAML File", pathEntry),
 	}
-	
+
 	d := dialog.NewForm("Import Sessions", "Import", "Cancel", items,
 		func(confirmed bool) {
 			if !confirmed || pathEntry.Text == "" {
 				return
 			}
-			
+
 			// Create temp store to load from file
 			tempStore := NewSessionStore(pathEntry.Text)
 			if err := tempStore.Load(); err != nil {
 				dialog.ShowError(fmt.Errorf("failed to load: %w", err), e.window)
 				return
 			}
-			
+
 			// Merge folders and sessions
 			imported := 0
 			for _, folder := range tempStore.folders {
@@ -461,26 +475,34 @@ func (e *SessionEditor) showImportDialog() {
 							port = p
 						}
 					}
-					
+
+					// FIX: Include ALL session fields, especially auth data!
 					e.sessionStore.AddSession(folder.FolderName, SessionInfo{
-						Name:       sess.DisplayName,
-						Host:       sess.Host,
-						Port:       port,
-						DeviceType: sess.DeviceType,
-						Vendor:     sess.Vendor,
-						Model:      sess.Model,
-						CredsID:    sess.CredsID,
+						Name:          sess.DisplayName,
+						Host:          sess.Host,
+						Port:          port,
+						Username:      sess.Username,
+						AuthType:      stringToAuthType(sess.AuthType),
+						KeyPath:       sess.KeyPath,
+						KeyPassphrase: sess.KeyPassphrase,
+						DeviceType:    sess.DeviceType,
+						Vendor:        sess.Vendor,
+						Model:         sess.Model,
+						CredsID:       sess.CredsID,
 					})
 					imported++
+
+					log.Printf("Imported session: %s, AuthType=%s, KeyPath=%s",
+						sess.DisplayName, sess.AuthType, sess.KeyPath)
 				}
 			}
-			
+
 			e.saveAndRefresh()
-			dialog.ShowInformation("Import Complete", 
+			dialog.ShowInformation("Import Complete",
 				fmt.Sprintf("Imported %d sessions from %d folders.", imported, len(tempStore.folders)),
 				e.window)
 		}, e.window)
-	
+
 	d.Resize(fyne.NewSize(450, 150))
 	d.Show()
 }
@@ -491,8 +513,8 @@ func (e *SessionEditor) exportSessions() {
 		dialog.ShowError(err, e.window)
 		return
 	}
-	
-	dialog.ShowInformation("Export Complete", 
+
+	dialog.ShowInformation("Export Complete",
 		fmt.Sprintf("Sessions saved to:\n%s", e.sessionStore.filePath),
 		e.window)
 }
@@ -504,16 +526,16 @@ func (e *SessionEditor) saveAndRefresh() {
 		dialog.ShowError(err, e.window)
 		return
 	}
-	
+
 	e.refreshData()
-	
+
 	if e.folderList != nil {
 		e.folderList.Refresh()
 	}
 	if e.sessionList != nil {
 		e.sessionList.Refresh()
 	}
-	
+
 	// Notify parent to refresh its session list
 	if e.onSave != nil {
 		e.onSave()
@@ -527,11 +549,15 @@ func (s *SessionStore) UpdateSession(sessionID string, updated SessionInfo) bool
 		for si := range s.folders[fi].Sessions {
 			id := fmt.Sprintf("%s-%d", s.folders[fi].FolderName, si)
 			if id == sessionID {
-				// Update in place
+				// FIX: Update ALL fields including auth data!
 				s.folders[fi].Sessions[si] = SessionYAML{
 					DisplayName:     updated.Name,
 					Host:            updated.Host,
 					Port:            strconv.Itoa(updated.Port),
+					Username:        updated.Username,
+					AuthType:        authTypeToString(updated.AuthType),
+					KeyPath:         updated.KeyPath,
+					KeyPassphrase:   updated.KeyPassphrase,
 					DeviceType:      updated.DeviceType,
 					Vendor:          updated.Vendor,
 					Model:           updated.Model,
@@ -539,6 +565,8 @@ func (s *SessionStore) UpdateSession(sessionID string, updated SessionInfo) bool
 					SerialNumber:    s.folders[fi].Sessions[si].SerialNumber,
 					SoftwareVersion: s.folders[fi].Sessions[si].SoftwareVersion,
 				}
+				log.Printf("Updated session %s: AuthType=%s, KeyPath=%s",
+					sessionID, updated.AuthType, updated.KeyPath)
 				return true
 			}
 		}
@@ -555,13 +583,13 @@ func (s *SessionStore) MoveSession(sessionID string, targetFolder string) bool {
 			if id == sessionID {
 				// Copy session data
 				sess := s.folders[fi].Sessions[si]
-				
+
 				// Remove from current folder
 				s.folders[fi].Sessions = append(
 					s.folders[fi].Sessions[:si],
 					s.folders[fi].Sessions[si+1:]...,
 				)
-				
+
 				// Find or create target folder
 				var target *SessionFolder
 				for i := range s.folders {
@@ -570,7 +598,7 @@ func (s *SessionStore) MoveSession(sessionID string, targetFolder string) bool {
 						break
 					}
 				}
-				
+
 				if target == nil {
 					s.folders = append(s.folders, SessionFolder{
 						FolderName: targetFolder,
@@ -578,7 +606,7 @@ func (s *SessionStore) MoveSession(sessionID string, targetFolder string) bool {
 					})
 					target = &s.folders[len(s.folders)-1]
 				}
-				
+
 				// Add to target folder
 				target.Sessions = append(target.Sessions, sess)
 				return true
