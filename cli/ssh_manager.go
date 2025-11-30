@@ -172,8 +172,20 @@ func (sm *SessionManager) saveSessions() {
 
 // refreshSessions reloads sessions from store and applies current filter
 func (sm *SessionManager) refreshSessions() {
+	log.Printf("refreshSessions: Reloading sessions from store")
+	
+	// Get fresh data from the store
 	sm.savedSessions = sm.sessionStore.GetSessions()
+	log.Printf("refreshSessions: Got %d sessions from store", len(sm.savedSessions))
+	
+	// Apply current filter
 	sm.applyFilter()
+	
+	// Force tree refresh
+	if sm.sessionTree != nil {
+		sm.sessionTree.Refresh()
+		log.Printf("refreshSessions: Tree refreshed")
+	}
 }
 
 // applyFilter filters sessions based on current filterText
@@ -651,6 +663,7 @@ func (sm *SessionManager) showSessionEditor() {
 	}
 	
 	editor := NewSessionEditor(sm.window, sm.sessionStore, func() {
+		log.Printf("showSessionEditor: onSave callback triggered")
 		sm.refreshSessions()
 	})
 	

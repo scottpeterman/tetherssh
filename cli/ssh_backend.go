@@ -321,6 +321,7 @@ func (s *SSHBackend) Connect() error {
 }
 
 // buildClientConfig creates the SSH client configuration with auth methods
+
 func (s *SSHBackend) buildClientConfig() (*ssh.ClientConfig, error) {
 	// Build authentication methods in priority order
 	authMethods, err := s.buildAuthMethods()
@@ -343,17 +344,66 @@ func (s *SSHBackend) buildClientConfig() (*ssh.ClientConfig, error) {
 		Auth:            authMethods,
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         s.config.Timeout,
-		// Support modern key exchange algorithms
+		// Support modern AND legacy algorithms for old network gear
 		Config: ssh.Config{
+			// Key Exchange Algorithms - modern first, then legacy
 			KeyExchanges: []string{
+				// Modern (preferred)
 				"curve25519-sha256",
 				"curve25519-sha256@libssh.org",
 				"ecdh-sha2-nistp256",
 				"ecdh-sha2-nistp384",
 				"ecdh-sha2-nistp521",
 				"diffie-hellman-group14-sha256",
+				"diffie-hellman-group16-sha512",
+				"diffie-hellman-group18-sha512",
+				// Legacy (for old Cisco/Juniper gear)
 				"diffie-hellman-group14-sha1",
+				"diffie-hellman-group1-sha1",
+				"diffie-hellman-group-exchange-sha256",
+				"diffie-hellman-group-exchange-sha1",
 			},
+			// Ciphers - modern first, then legacy CBC modes
+			Ciphers: []string{
+				// Modern (preferred)
+				"chacha20-poly1305@openssh.com",
+				"aes128-gcm@openssh.com",
+				"aes256-gcm@openssh.com",
+				"aes128-ctr",
+				"aes192-ctr",
+				"aes256-ctr",
+				// Legacy CBC modes (for old gear)
+				"aes128-cbc",
+				"aes192-cbc",
+				"aes256-cbc",
+				"3des-cbc",
+			},
+			// MACs - modern first, then legacy
+			MACs: []string{
+				// Modern (preferred)
+				"hmac-sha2-256-etm@openssh.com",
+				"hmac-sha2-512-etm@openssh.com",
+				"hmac-sha2-256",
+				"hmac-sha2-512",
+				// Legacy (for old gear)
+				"hmac-sha1",
+				"hmac-sha1-96",
+				"hmac-md5",
+				"hmac-md5-96",
+			},
+		},
+		// Also support legacy host key algorithms
+		HostKeyAlgorithms: []string{
+			// Modern (preferred)
+			"ssh-ed25519",
+			"ecdsa-sha2-nistp256",
+			"ecdsa-sha2-nistp384",
+			"ecdsa-sha2-nistp521",
+			"rsa-sha2-512",
+			"rsa-sha2-256",
+			// Legacy (for old gear)
+			"ssh-rsa",
+			"ssh-dss",
 		},
 	}
 
