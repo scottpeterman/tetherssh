@@ -554,9 +554,12 @@ func (t *NativeTerminalWidget) CalculateTerminalSize(width, height float32) (int
 		usableHeight = height - 2
 	}
 	// Calculate columns and rows
+	
 	cols := int(usableWidth / t.charWidth)
 	rows := int(usableHeight / t.charHeight)
-
+    settings := GetSettings().Get()
+	rows = rows - settings.RowOffset
+	cols = cols - settings.ColOffset
 	// Apply reasonable limits
 	if cols < 10 {
 		cols = 10
