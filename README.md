@@ -4,6 +4,8 @@ A Go-based SSH terminal emulator with session management, built on Fyne 2 GUI fr
 
 The first fully-functional Fyne-based SSH terminal with session management, scrollback history, and text selection.
 
+**[View on Fyne Apps Showcase](https://apps.fyne.io/apps/com.github.scottpeterman.tetherssh.html)**
+
 ## Screenshots
 
 ### Session Manager with Tree View
@@ -23,7 +25,7 @@ CRUD interface for managing sessions and folders with full authentication config
 
 ---
 
-## Current Status: Alpha (v0.2.0)
+## Current Status: Alpha (v0.2.1)
 
 ### Working
 
@@ -37,6 +39,7 @@ CRUD interface for managing sessions and folders with full authentication config
 - Scrollback history (1000+ lines) with mouse wheel scrolling
 - Text selection with clipboard support (double-click word, triple-click line)
 - Tree-based session navigator with collapsible folders
+- Right-click context menu on sessions (Connect, Edit)
 - Session persistence via YAML configuration
 - Session search/filter for quick access to devices
 - Session editor with full CRUD operations
@@ -46,7 +49,6 @@ CRUD interface for managing sessions and folders with full authentication config
 
 ### Known Issues
 
-- UI freezes on application close (cleanup race condition) - partially fixed
 - SSH agent support not fully implemented
 - Host key verification not yet implemented
 
@@ -66,6 +68,7 @@ TetherSSH uses gopyte, a custom terminal emulation library written specifically 
 ### Session Management
 
 - Tree-based navigator with collapsible folders and session counts
+- Right-click context menu for quick Connect or Edit
 - Real-time search/filter - instantly find sessions by name, host, group, or device type
 - Multiple concurrent SSH connections in tabs
 - Visual connection status indicators
@@ -101,7 +104,11 @@ Press the gear button to open the full session manager:
 
 ### Session Persistence
 
-Sessions are stored in `./sessions/sessions.yaml` (relative to app directory):
+All configuration is stored in `~/.velocitycmd/` for consistency across the VelociTerm ecosystem:
+
+- Sessions: `~/.velocitycmd/sessions/sessions.yaml`
+- Settings: `~/.velocitycmd/settings.json`
+- Logs: `~/.velocitycmd/logs/` (when logging is enabled)
 
 ```yaml
 # TetherSSH Sessions File
@@ -132,7 +139,7 @@ Sessions are stored in `./sessions/sessions.yaml` (relative to app directory):
 
 ## Settings
 
-Press the gear icon in the toolbar to open the Settings dialog. Settings are persisted to `./settings.json`.
+Press the gear icon in the toolbar to open the Settings dialog. Settings are persisted to `~/.velocitycmd/settings.json`.
 
 ### Terminal Tab
 
@@ -166,7 +173,7 @@ Press the gear icon in the toolbar to open the Settings dialog. Settings are per
 | Setting | Description | Default |
 |---------|-------------|---------|
 | Enable Logging | Write session output to log files | Off |
-| Log Directory | Directory for session logs | ./logs |
+| Log Directory | Directory for session logs | ~/.velocitycmd/logs |
 | Timestamp Logs | Prefix log entries with timestamps | On |
 
 Log filename format: `{session_name}_{YYYYMMDD_HHMMSS}.log`
@@ -179,6 +186,7 @@ Log filename format: `{session_name}_{YYYYMMDD_HHMMSS}.log`
 tetherssh/
 ├── cli/
 │   ├── main.go                  # Application entry, window setup
+│   ├── paths.go                 # Centralized path management (~/.velocitycmd)
 │   ├── session_manager.go       # Tree navigator, search, tab management
 │   ├── session_persistence.go   # YAML load/save, SessionStore
 │   ├── session_editor.go        # CRUD modal dialog
@@ -191,6 +199,7 @@ tetherssh/
 │   ├── terminal_display.go      # TextGrid rendering, viewport calculation
 │   ├── terminal_selection.go    # Text selection and clipboard
 │   ├── terminal_containers.go   # Custom container widgets
+│   ├── tappable_tree_node.go    # Right-click support for tree nodes
 │   ├── theme.go                 # Fyne theme, color mappings
 │   ├── pty_unix.go              # Unix PTY implementation
 │   └── pty_windows.go           # Windows PTY implementation
@@ -212,8 +221,6 @@ tetherssh/
 │   ├── htop.png
 │   ├── session_detail.png
 │   └── session_manager.png
-├── sessions/
-│   └── sessions.yaml            # Session configuration
 ├── go.mod
 ├── go.sum
 ├── LICENSE
@@ -297,9 +304,17 @@ gopkg.in/yaml.v3              # Session persistence
 
 ## Configuration
 
-### Session File Location
+### Configuration Location
 
-TetherSSH looks for sessions in `./sessions/sessions.yaml` relative to the application directory. If not found, a stub file is created with example entries.
+TetherSSH stores all configuration in `~/.velocitycmd/` for consistency with the VelociTerm ecosystem:
+
+| File | Purpose |
+|------|---------|
+| `~/.velocitycmd/sessions/sessions.yaml` | Session definitions |
+| `~/.velocitycmd/settings.json` | Application settings |
+| `~/.velocitycmd/logs/` | Session logs (when enabled) |
+
+On first run, a stub sessions file is created with example entries.
 
 ### Supported Auth Types
 
@@ -335,6 +350,7 @@ The `~` character is expanded to the user's home directory:
 - Quick Connect dialog
 - Tree-based session navigator
 - Settings dialog with persistence
+- Right-click context menu
 
 ### Phase 2: Stability (Current)
 
@@ -410,6 +426,6 @@ MIT License - See LICENSE file
 
 ---
 
-Last updated: November 30, 2025
+Last updated: December 1, 2025
 
 Author: Scott Peterman
