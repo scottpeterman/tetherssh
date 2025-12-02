@@ -265,19 +265,13 @@ func (t *NativeTheme) cyberColor(name fyne.ThemeColorName) color.Color {
 		}
 		return cyberSurfaceContainer
 
-	// Hover state
+// Hover state
 	case theme.ColorNameHover:
 		if c := t.getOverrideColor("hover"); c != nil {
 			return c
 		}
-		return color.RGBA{0x00, 0x33, 0x44, 0xff}
+		return color.RGBA{0x00, 0x55, 0x66, 0xff}  // Solid dark teal
 
-	// Selection
-	case theme.ColorNameSelection:
-		if c := t.getOverrideColor("selection"); c != nil {
-			return c
-		}
-		return color.RGBA{0x00, 0xcc, 0xff, 0x40} // Cyan with transparency
 
 	// Separators and scrollbars
 	case theme.ColorNameSeparator:

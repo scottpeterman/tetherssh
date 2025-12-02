@@ -338,11 +338,10 @@ The `~` character is expanded to the user's home directory:
 
 ### Phase 2: Stability (Current)
 
-- Fix application close freeze completely
 - Implement SSH agent support
 - Add host key verification with known_hosts
 - Clean up debug logging
-- Cross-platform testing (Windows, Linux, macOS)
+- More cross-platform testing (Windows, Linux, macOS)
 
 ### Phase 3: Logging and Security
 

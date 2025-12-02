@@ -9,16 +9,17 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/google/uuid"
 )
 
 // SessionInfo holds metadata about a saved session
@@ -388,18 +389,21 @@ func (sm *SessionManager) buildSessionTree() *widget.Tree {
 				return container.NewHBox(icon, name, count)
 			}
 			
-			// Session row
+			// Session row - wrap in TappableBox for right-click
 			icon := widget.NewIcon(theme.ComputerIcon())
 			name := widget.NewLabel("Session Name")
 			name.TextStyle = fyne.TextStyle{Bold: true}
 			host := widget.NewLabel("host:port")
 			status := widget.NewLabel("")
 			
-			return container.NewHBox(
+			content := container.NewHBox(
 				icon,
 				container.NewVBox(name, host),
 				status,
 			)
+			
+			// We'll set the callback in UpdateNode since we need the session context
+			return NewTappableBox(content, nil)
 		},
 		
 		// UpdateNode - populate with actual data
@@ -437,7 +441,8 @@ func (sm *SessionManager) buildSessionTree() *widget.Tree {
 					return
 				}
 				
-				box := o.(*fyne.Container)
+				tappable := o.(*TappableBox)
+				box := tappable.content.(*fyne.Container)
 				vbox := box.Objects[1].(*fyne.Container)
 				nameLabel := vbox.Objects[0].(*widget.Label)
 				hostLabel := vbox.Objects[1].(*widget.Label)
@@ -464,6 +469,13 @@ func (sm *SessionManager) buildSessionTree() *widget.Tree {
 				}
 				sm.tabsMutex.RUnlock()
 				statusLabel.SetText(statusText)
+				
+				// Set up right-click handler for this session
+				sessionCopy := *session // Capture for closure
+				nodeID := uid           // Capture for reselection
+				tappable.onSecondaryTap = func(pos fyne.Position) {
+					sm.showSessionContextMenu(pos, sessionCopy, nodeID)
+				}
 			}
 		},
 	)
@@ -498,6 +510,183 @@ func (sm *SessionManager) buildSessionTree() *widget.Tree {
 	}
 	
 	return tree
+}
+
+// showSessionContextMenu displays a right-click menu for a session
+func (sm *SessionManager) showSessionContextMenu(pos fyne.Position, session SessionInfo, nodeID string) {
+	// Create a popup with custom styled buttons instead of PopUpMenu
+	var popup *widget.PopUp
+	
+	connectBtn := widget.NewButton("  Connect", func() {
+		popup.Hide()
+		sm.connectToSession(session)
+	})
+	connectBtn.Icon = theme.MediaPlayIcon()
+	connectBtn.Importance = widget.LowImportance
+	connectBtn.Alignment = widget.ButtonAlignLeading
+	
+	editBtn := widget.NewButton("  Edit", func() {
+		popup.Hide()
+		sm.editSession(session, nodeID)
+	})
+	editBtn.Icon = theme.DocumentCreateIcon()
+	editBtn.Importance = widget.LowImportance
+	editBtn.Alignment = widget.ButtonAlignLeading
+	
+	// Stack buttons vertically with consistent width
+	content := container.NewVBox(
+		connectBtn,
+		editBtn,
+	)
+	
+	popup = widget.NewPopUp(content, sm.window.Canvas())
+	popup.ShowAtPosition(pos)
+}
+// editSession opens a dialog to edit a single session, then reloads and reselects
+func (sm *SessionManager) editSession(session SessionInfo, nodeID string) {
+	// Create entry fields pre-filled with session data
+	nameEntry := widget.NewEntry()
+	nameEntry.SetText(session.Name)
+	
+	hostEntry := widget.NewEntry()
+	hostEntry.SetText(session.Host)
+	
+	portEntry := widget.NewEntry()
+	portEntry.SetText(strconv.Itoa(session.Port))
+	
+	usernameEntry := widget.NewEntry()
+	usernameEntry.SetText(session.Username)
+	
+	authSelect := widget.NewSelect([]string{"Password", "SSH Key", "Keyboard Interactive"}, nil)
+	switch session.AuthType {
+	case AuthPublicKey:
+		authSelect.SetSelected("SSH Key")
+	case AuthKeyboardInteractive:
+		authSelect.SetSelected("Keyboard Interactive")
+	default:
+		authSelect.SetSelected("Password")
+	}
+	
+	keyPathEntry := widget.NewEntry()
+	keyPathEntry.SetText(session.KeyPath)
+	if session.AuthType != AuthPublicKey {
+		keyPathEntry.Disable()
+	}
+	
+	keyPassEntry := widget.NewPasswordEntry()
+	keyPassEntry.SetText(session.KeyPassphrase)
+	if session.AuthType != AuthPublicKey {
+		keyPassEntry.Disable()
+	}
+	
+	deviceTypeEntry := widget.NewEntry()
+	deviceTypeEntry.SetText(session.DeviceType)
+	
+	vendorEntry := widget.NewEntry()
+	vendorEntry.SetText(session.Vendor)
+	
+	modelEntry := widget.NewEntry()
+	modelEntry.SetText(session.Model)
+	
+	// Toggle key fields based on auth type
+	authSelect.OnChanged = func(s string) {
+		if s == "SSH Key" {
+			keyPathEntry.Enable()
+			keyPassEntry.Enable()
+		} else {
+			keyPathEntry.Disable()
+			keyPassEntry.Disable()
+		}
+	}
+	
+	items := []*widget.FormItem{
+		widget.NewFormItem("Display Name", nameEntry),
+		widget.NewFormItem("Host", hostEntry),
+		widget.NewFormItem("Port", portEntry),
+		widget.NewFormItem("Username", usernameEntry),
+		widget.NewFormItem("Auth Type", authSelect),
+		widget.NewFormItem("Key Path", keyPathEntry),
+		widget.NewFormItem("Key Passphrase", keyPassEntry),
+		widget.NewFormItem("Device Type", deviceTypeEntry),
+		widget.NewFormItem("Vendor", vendorEntry),
+		widget.NewFormItem("Model", modelEntry),
+	}
+	
+	d := dialog.NewForm("Edit Session", "Save", "Cancel", items,
+		func(confirmed bool) {
+			if !confirmed {
+				return
+			}
+			
+			// Validate
+			if hostEntry.Text == "" {
+				dialog.ShowError(fmt.Errorf("host is required"), sm.window)
+				return
+			}
+			
+			// Parse port
+			port := 22
+			if portEntry.Text != "" {
+				if p, err := strconv.Atoi(portEntry.Text); err == nil {
+					port = p
+				}
+			}
+			
+			// Parse auth type
+			var authType AuthMethod
+			switch authSelect.Selected {
+			case "SSH Key":
+				authType = AuthPublicKey
+			case "Keyboard Interactive":
+				authType = AuthKeyboardInteractive
+			default:
+				authType = AuthPassword
+			}
+			
+			// Build updated session
+			updatedSession := SessionInfo{
+				ID:            session.ID,
+				Name:          nameEntry.Text,
+				Host:          hostEntry.Text,
+				Port:          port,
+				Username:      usernameEntry.Text,
+				AuthType:      authType,
+				KeyPath:       keyPathEntry.Text,
+				KeyPassphrase: keyPassEntry.Text,
+				Group:         session.Group,
+				DeviceType:    deviceTypeEntry.Text,
+				Vendor:        vendorEntry.Text,
+				Model:         modelEntry.Text,
+				CredsID:       session.CredsID,
+			}
+			
+			// Default display name if empty
+			if updatedSession.Name == "" {
+				if updatedSession.Username != "" {
+					updatedSession.Name = fmt.Sprintf("%s@%s", updatedSession.Username, updatedSession.Host)
+				} else {
+					updatedSession.Name = updatedSession.Host
+				}
+			}
+			
+			// Update in store
+			if sm.sessionStore.UpdateSession(session.ID, updatedSession) {
+				sm.saveSessions()
+				sm.refreshSessions()
+				
+				// Reselect the node
+				sm.sessionTree.Select(nodeID)
+				sm.selectedNodeID = nodeID
+				sm.selectedSession = sm.sessionByID[nodeID]
+				
+				log.Printf("Updated session: %s", updatedSession.Name)
+			} else {
+				dialog.ShowError(fmt.Errorf("failed to update session"), sm.window)
+			}
+		}, sm.window)
+	
+	d.Resize(fyne.NewSize(450, 500))
+	d.Show()
 }
 
 // buildSidebarHeader creates the sidebar header with title and buttons
