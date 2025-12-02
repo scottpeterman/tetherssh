@@ -56,12 +56,11 @@ func NewSessionStore(filePath string) *SessionStore {
 }
 
 // DefaultSessionPath returns the default path for the sessions file
-// Priority: ./sessions/sessions.yaml (app working directory)
+// Location: ~/.velocitycmd/sessions/sessions.yaml
 // If not found, creates a stub file there
 func DefaultSessionPath() string {
-	// Always use app's working directory
-	sessionDir := "sessions"
-	sessionFile := filepath.Join(sessionDir, "sessions.yaml")
+	sessionDir := GetSessionsDir()       // From paths.go - ~/.velocitycmd/sessions
+	sessionFile := GetSessionsFilePath() // From paths.go - ~/.velocitycmd/sessions/sessions.yaml
 
 	// Check if it exists
 	if _, err := os.Stat(sessionFile); err == nil {

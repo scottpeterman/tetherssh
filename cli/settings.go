@@ -104,7 +104,7 @@ func DefaultSettings() *AppSettings {
 
 		// Logging
 		EnableLogging: false,
-		LogDirectory:  "./logs",
+		LogDirectory:  GetLogsDir(),
 		TimestampLogs: true,
 
 		// Terminal Behavior
@@ -197,8 +197,7 @@ func NewSettingsManager() *SettingsManager {
 
 // getSettingsPath returns the path to the settings file
 func getSettingsPath() string {
-	// Store settings in app directory
-	return "./settings.json"
+	return GetSettingsPath() 
 }
 
 // Load reads settings from disk
